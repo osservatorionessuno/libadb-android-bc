@@ -21,7 +21,7 @@ repositories {
 // Add to dependencies section
 dependencies {
     // Add this library
-    implementation 'com.github.MuntashirAkon:libadb-android:3.1.0'
+    implementation 'com.github.MuntashirAkon:libadb-android:3.1.1'
     
     // Library to generate X509Certificate. You can also use BouncyCastle for
     // this. See example for use-case.
