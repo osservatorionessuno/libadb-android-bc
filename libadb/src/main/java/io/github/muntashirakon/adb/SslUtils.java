@@ -3,7 +3,6 @@
 package io.github.muntashirakon.adb;
 
 import android.annotation.SuppressLint;
-import android.os.Build;
 
 import androidx.annotation.NonNull;
 
@@ -21,13 +20,11 @@ import javax.net.ssl.SSLContext;
 import javax.net.ssl.X509ExtendedKeyManager;
 import javax.net.ssl.X509TrustManager;
 
-final class SslUtils {
-    private static boolean customConscrypt = false;
-    private static SSLContext sslContext;
+import org.bouncycastle.jce.provider.BouncyCastleProvider;
+import org.bouncycastle.jsse.provider.BouncyCastleJsseProvider;
 
-    public static boolean isCustomConscrypt() {
-        return customConscrypt;
-    }
+final class SslUtils {
+    private static SSLContext sslContext;
 
     @SuppressLint("TrulyRandom") // The users are already instructed to fix this issue
     @NonNull
@@ -35,22 +32,11 @@ final class SslUtils {
         if (sslContext != null) {
             return sslContext;
         }
-        try {
-            Class<?> providerClass = Class.forName("org.conscrypt.OpenSSLProvider");
-            Provider openSslProvder = (Provider) providerClass.getDeclaredConstructor().newInstance();
-            sslContext = SSLContext.getInstance("TLSv1.3", openSslProvder);
-            customConscrypt = true;
-        } catch (NoSuchAlgorithmException e) {
-            throw e;
-        } catch (Throwable e) {
-            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
-                // Custom error message to inform user that they should use custom Conscrypt library.
-                throw new NoSuchAlgorithmException("TLSv1.3 isn't supported on your platform. Use custom Conscrypt library instead.");
-            }
-            sslContext = SSLContext.getInstance("TLSv1.3");
-            customConscrypt = false;
-        }
-        System.out.println("Using " + (customConscrypt ? "custom" : "default") + " TLSv1.3 provider...");
+        Provider bcProvider = new BouncyCastleProvider();
+        Provider bcJsseProvider = new BouncyCastleJsseProvider(bcProvider);
+        sslContext = SSLContext.getInstance("TLSv1.3", bcJsseProvider);
+        System.out.println("Using BouncyCastle TLSv1.3 provider...");
+        
         sslContext.init(new KeyManager[]{getKeyManager(keyPair)},
                 new X509TrustManager[]{getAllAcceptingTrustManager()},
                 new SecureRandom());

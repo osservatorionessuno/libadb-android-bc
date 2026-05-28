@@ -32,6 +32,8 @@ import javax.net.ssl.SSLException;
 import javax.net.ssl.SSLServerSocket;
 import javax.net.ssl.SSLSocket;
 
+import org.bouncycastle.jsse.BCSSLSocket;
+
 // https://github.com/aosp-mirror/platform_system_core/blob/android-11.0.0_r1/adb/pairing_connection/pairing_connection.cpp
 // Also based on Shizuku's implementation
 @RequiresApi(Build.VERSION_CODES.GINGERBREAD)
@@ -125,7 +127,7 @@ public final class PairingConnectionCtx implements Closeable {
         if (mRole == Role.Server) {
             SSLServerSocket sslServerSocket = (SSLServerSocket) mSslContext.getServerSocketFactory().createServerSocket(mPort);
             socket = sslServerSocket.accept();
-            // TODO: Write automated test scripts after removing Conscrypt dependency.
+            // TODO: Write automated test scripts.
         } else { // role == Role.Client
             socket = new Socket(mHost, mPort);
         }
@@ -141,7 +143,8 @@ public final class PairingConnectionCtx implements Closeable {
 
         // To ensure the connection is not stolen while we do the PAKE, append the exported key material from the
         // tls connection to the password.
-        byte[] keyMaterial = exportKeyingMaterial(sslSocket, EXPORT_KEY_SIZE);
+        BCSSLSocket bcsslsocket = ((BCSSLSocket) sslSocket);
+        byte[] keyMaterial = bcsslsocket.getBCSession().exportKeyingMaterialData(EXPORTED_KEY_LABEL, null, EXPORT_KEY_SIZE);
         byte[] passwordBytes = new byte[mPswd.length + keyMaterial.length];
         System.arraycopy(mPswd, 0, passwordBytes, 0, mPswd.length);
         System.arraycopy(keyMaterial, 0, passwordBytes, mPswd.length, keyMaterial.length);
@@ -151,31 +154,6 @@ public final class PairingConnectionCtx implements Closeable {
             throw new IOException("Unable to create PairingAuthCtx.");
         }
         this.mPairingAuthCtx = pairingAuthCtx;
-    }
-
-    @SuppressLint("PrivateApi") // Conscrypt is a stable private API
-    private byte[] exportKeyingMaterial(SSLSocket sslSocket, int length) throws SSLException {
-        // Conscrypt#exportKeyingMaterial(SSLSocket socket, String label, byte[] context, int length): byte[]
-        //          throws SSLException
-        try {
-            Class<?> conscryptClass;
-            if (SslUtils.isCustomConscrypt()) {
-                conscryptClass = Class.forName("org.conscrypt.Conscrypt");
-            } else if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
-                // Although support for conscrypt has been added in Android 5.0 (Lollipop),
-                // TLS1.3 isn't supported until Android 9 (Pie).
-                throw new SSLException("TLSv1.3 isn't supported on your platform. Use custom Conscrypt library instead.");
-            } else {
-                conscryptClass = Class.forName("com.android.org.conscrypt.Conscrypt");
-            }
-            Method exportKeyingMaterial = conscryptClass.getMethod("exportKeyingMaterial", SSLSocket.class,
-                    String.class, byte[].class, int.class);
-            return (byte[]) exportKeyingMaterial.invoke(null, sslSocket, EXPORTED_KEY_LABEL, null, length);
-        } catch (SSLException e) {
-            throw e;
-        } catch (Throwable th) {
-            throw new SSLException(th);
-        }
     }
 
     private void writeHeader(@NonNull PairingPacketHeader header, @NonNull byte[] payload) throws IOException {
