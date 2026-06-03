@@ -14,7 +14,6 @@ import java.io.Closeable;
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.io.IOException;
-import java.lang.reflect.Method;
 import java.net.Socket;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
@@ -22,17 +21,28 @@ import java.security.InvalidKeyException;
 import java.security.KeyManagementException;
 import java.security.NoSuchAlgorithmException;
 import java.security.PrivateKey;
+import java.security.SecureRandom;
 import java.security.cert.Certificate;
+import java.security.cert.CertificateEncodingException;
 import java.security.interfaces.RSAPublicKey;
 import java.util.Arrays;
 import java.util.Objects;
 
-import javax.net.ssl.SSLContext;
-import javax.net.ssl.SSLException;
-import javax.net.ssl.SSLServerSocket;
-import javax.net.ssl.SSLSocket;
-
-import org.bouncycastle.jsse.BCSSLSocket;
+import org.bouncycastle.jce.provider.BouncyCastleProvider;
+import org.bouncycastle.tls.CertificateEntry;
+import org.bouncycastle.tls.CertificateRequest;
+import org.bouncycastle.tls.DefaultTlsClient;
+import org.bouncycastle.tls.ProtocolVersion;
+import org.bouncycastle.tls.SignatureAndHashAlgorithm;
+import org.bouncycastle.tls.TlsAuthentication;
+import org.bouncycastle.tls.TlsClientProtocol;
+import org.bouncycastle.tls.TlsCredentials;
+import org.bouncycastle.tls.TlsServerCertificate;
+import org.bouncycastle.tls.crypto.TlsCertificate;
+import org.bouncycastle.tls.crypto.TlsCryptoParameters;
+import org.bouncycastle.tls.crypto.impl.jcajce.JcaDefaultTlsCredentialedSigner;
+import org.bouncycastle.tls.crypto.impl.jcajce.JcaTlsCrypto;
+import org.bouncycastle.tls.crypto.impl.jcajce.JcaTlsCryptoProvider;
 
 // https://github.com/aosp-mirror/platform_system_core/blob/android-11.0.0_r1/adb/pairing_connection/pairing_connection.cpp
 // Also based on Shizuku's implementation
@@ -59,7 +69,7 @@ public final class PairingConnectionCtx implements Closeable {
     private final int mPort;
     private final byte[] mPswd;
     private final PeerInfo mPeerInfo;
-    private final SSLContext mSslContext;
+    private final KeyPair mKeyPair;
     private final Role mRole = Role.Client;
 
     private DataInputStream mInputStream;
@@ -75,7 +85,7 @@ public final class PairingConnectionCtx implements Closeable {
         this.mPswd = Objects.requireNonNull(pswd);
         this.mPeerInfo = new PeerInfo(PeerInfo.ADB_RSA_PUB_KEY, AndroidPubkey.encodeWithName((RSAPublicKey)
                 keyPair.getPublicKey(), Objects.requireNonNull(deviceName)));
-        this.mSslContext = SslUtils.getSslContext(keyPair);
+        this.mKeyPair = keyPair;
     }
 
     public PairingConnectionCtx(@NonNull String host, int port, @NonNull byte[] pswd, @NonNull PrivateKey privateKey,
@@ -123,28 +133,34 @@ public final class PairingConnectionCtx implements Closeable {
     }
 
     private void setupTlsConnection() throws IOException {
-        Socket socket;
         if (mRole == Role.Server) {
-            SSLServerSocket sslServerSocket = (SSLServerSocket) mSslContext.getServerSocketFactory().createServerSocket(mPort);
-            socket = sslServerSocket.accept();
-            // TODO: Write automated test scripts.
-        } else { // role == Role.Client
-            socket = new Socket(mHost, mPort);
+            // The server role is unused; only the low-level client is implemented (see AdbTlsClient).
+            throw new IOException("Server role is not supported.");
         }
+        Socket socket = new Socket(mHost, mPort);
         socket.setTcpNoDelay(true);
 
-        // We use custom SSLContext to allow any SSL certificates
-        SSLSocket sslSocket = (SSLSocket) mSslContext.getSocketFactory().createSocket(socket, mHost, mPort, true);
-        sslSocket.startHandshake();
+        // BouncyCastle's JSSE (SSLSocket) clears the TLS 1.3 exporter secret before application code can run, so we
+        // drive the handshake with the low-level TLS API instead. This lets AdbTlsClient export the keying material
+        // from within notifyHandshakeComplete(), while the exporter secret is still alive. Any server certificate is
+        // accepted; the connection is authenticated via SPAKE2 over that exported keying material.
+        JcaTlsCrypto crypto = new JcaTlsCryptoProvider()
+                .setProvider(new BouncyCastleProvider())
+                .create(new SecureRandom());
+        TlsClientProtocol protocol = new TlsClientProtocol(socket.getInputStream(), socket.getOutputStream());
+        AdbTlsClient client = new AdbTlsClient(crypto, mKeyPair);
+        protocol.connect(client);
         Log.d(TAG, "Handshake succeeded.");
 
-        mInputStream = new DataInputStream(sslSocket.getInputStream());
-        mOutputStream = new DataOutputStream(sslSocket.getOutputStream());
+        mInputStream = new DataInputStream(protocol.getInputStream());
+        mOutputStream = new DataOutputStream(protocol.getOutputStream());
 
         // To ensure the connection is not stolen while we do the PAKE, append the exported key material from the
         // tls connection to the password.
-        BCSSLSocket bcsslsocket = ((BCSSLSocket) sslSocket);
-        byte[] keyMaterial = bcsslsocket.getBCSession().exportKeyingMaterialData(EXPORTED_KEY_LABEL, null, EXPORT_KEY_SIZE);
+        byte[] keyMaterial = client.getKeyingMaterial();
+        if (keyMaterial == null) {
+            throw new IOException("Failed to export TLS keying material.");
+        }
         byte[] passwordBytes = new byte[mPswd.length + keyMaterial.length];
         System.arraycopy(mPswd, 0, passwordBytes, 0, mPswd.length);
         System.arraycopy(keyMaterial, 0, passwordBytes, mPswd.length, keyMaterial.length);
@@ -255,15 +271,72 @@ public final class PairingConnectionCtx implements Closeable {
     public void close() {
         Arrays.fill(mPswd, (byte) 0);
         try {
-            mInputStream.close();
+            if (mInputStream != null) mInputStream.close();
         } catch (IOException ignore) {
         }
         try {
-            mOutputStream.close();
+            if (mOutputStream != null) mOutputStream.close();
         } catch (IOException ignore) {
         }
-        if (mState != State.Ready) {
+        if (mState != State.Ready && mPairingAuthCtx != null) {
             mPairingAuthCtx.destroy();
+        }
+    }
+
+    // A minimal TLS 1.3 client for ADB pairing: it presents the local key pair's self-signed certificate, accepts
+    // any server certificate, and exports the keying material from notifyHandshakeComplete() (the only point at
+    // which BouncyCastle keeps the TLS 1.3 exporter secret alive).
+    private static class AdbTlsClient extends DefaultTlsClient {
+        private final KeyPair mKeyPair;
+        private byte[] mKeyingMaterial;
+
+        AdbTlsClient(@NonNull JcaTlsCrypto crypto, @NonNull KeyPair keyPair) {
+            super(crypto);
+            this.mKeyPair = keyPair;
+        }
+
+        @Nullable
+        byte[] getKeyingMaterial() {
+            return mKeyingMaterial;
+        }
+
+        @Override
+        public ProtocolVersion[] getProtocolVersions() {
+            // ADB pairing requires TLS 1.3 (the exporter master secret is only defined there).
+            return ProtocolVersion.TLSv13.only();
+        }
+
+        @Override
+        public TlsAuthentication getAuthentication() {
+            return new TlsAuthentication() {
+                @Override
+                public void notifyServerCertificate(TlsServerCertificate serverCertificate) {
+                    // Accept any certificate; the connection is authenticated out-of-band via SPAKE2.
+                }
+
+                @Override
+                public TlsCredentials getClientCredentials(CertificateRequest certificateRequest) throws IOException {
+                    JcaTlsCrypto crypto = (JcaTlsCrypto) getCrypto();
+                    TlsCertificate tlsCertificate;
+                    try {
+                        tlsCertificate = crypto.createCertificate(mKeyPair.getCertificate().getEncoded());
+                    } catch (CertificateEncodingException e) {
+                        throw new IOException(e);
+                    }
+                    // Echo back the server's certificate_request_context, as required for the TLS 1.3 Certificate message.
+                    org.bouncycastle.tls.Certificate certificate = new org.bouncycastle.tls.Certificate(
+                            certificateRequest.getCertificateRequestContext(),
+                            new CertificateEntry[]{new CertificateEntry(tlsCertificate, null)});
+                    return new JcaDefaultTlsCredentialedSigner(new TlsCryptoParameters(context), crypto,
+                            mKeyPair.getPrivateKey(), certificate, SignatureAndHashAlgorithm.rsa_pss_rsae_sha256);
+                }
+            };
+        }
+
+        @Override
+        public void notifyHandshakeComplete() throws IOException {
+            super.notifyHandshakeComplete();
+            mKeyingMaterial = context.exportKeyingMaterial(EXPORTED_KEY_LABEL, null, EXPORT_KEY_SIZE);
         }
     }
 
