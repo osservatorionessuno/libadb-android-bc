@@ -1,7 +1,7 @@
 jdk:
   - openjdk21
-before_install:
-  - sdk install java 21.0.4-tem
-  - sdk use java 21.0.4-tem
-  - sdk install maven
-  - mvn -v
+install:
+  # Build and publish only the library module. The sample ':app' module is an
+  # com.android.application that fails ':app:packageRelease' on JitPack and would
+  # otherwise fail the whole build, leaving the artifact unpublished.
+  - ./gradlew :libadb:publishToMavenLocal
