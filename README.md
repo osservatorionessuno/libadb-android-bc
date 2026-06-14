@@ -32,16 +32,14 @@ dependencies {
     // and write it as PEM. See example for use-case.
     implementation 'org.bouncycastle:bcprov-jdk15to18:1.84'
     implementation 'org.bouncycastle:bcpkix-jdk15to18:1.84'
-
-    // Use custom Conscrypt library. If you want to connect to a remote ADB
-    // daemon instead of the device the app is currently running, this is the
-    // recommended choice.
-    implementation 'org.conscrypt:conscrypt-android:2.5.3'
 }
 ```
 
-If you're using the custom Conscrypt library in order to connect to a remote ADB daemon and the app targets Android
-version below 4.4, you have to extend `android.app.Application` to apply fixes for the random number generation:
+TLS (including the TLSv1.3 handshake used by ADB pairing) is provided internally by BouncyCastle's JSSE provider, which
+ships transitively with the library — you don't need Conscrypt or any other TLS provider.
+
+If your app targets Android versions below 4.4 (API 19), extend `android.app.Application` to apply the `SecureRandom`
+fixes before any key generation:
 ```java
 public class MyAwesomeApp extends Application {
     @Override
@@ -53,9 +51,9 @@ public class MyAwesomeApp extends Application {
 }
 ```
 
-**Notice:** Conscrypt supports only API 9 (Gingerbread) or later, meaning you cannot use ADB pairing or any TLSv1.3
-features in API less than 9. The corresponding methods are already annotated properly. So, you don't have to worry about
-compatibility issues that may arise when your app's minimum SDK is set to one of the unsupported versions.
+**Notice:** ADB pairing and the TLSv1.3 handshake require API 9 (Gingerbread) or later. The corresponding methods are
+annotated with `@RequiresApi`, so you don't have to worry about compatibility issues that may arise when your app's
+minimum SDK is set to one of the unsupported versions.
 
 ### Configuring ADB
 Instead of doing everything manually, you can create a concrete implementation of the `AbsAdbConnectionManager` class. 
