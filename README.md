@@ -28,19 +28,14 @@ dependencies {
     // matching git tag (e.g. 3.2.0) on the fork, or use a commit hash.
     implementation 'com.github.osservatorionessuno:libadb-android-bc:3.2.0'
     
-    // Library to generate X509Certificate. You can also use BouncyCastle for
-    // this. See example for use-case.
-    // implementation 'com.github.MuntashirAkon:sun-security-android:1.1'
-
-    // Bypass hidden API if you want to use the Android default Conscrypt in
-    // Android 9 (Pie) or later. It also requires additional steps. See
-    // https://github.com/LSPosed/AndroidHiddenApiBypass to find out more about
-    // this.
-    // implementation 'org.lsposed.hiddenapibypass:hiddenapibypass:6.1'
+    // BouncyCastle, used in the example below to generate the X509Certificate
+    // and write it as PEM. See example for use-case.
+    implementation 'org.bouncycastle:bcprov-jdk15to18:1.84'
+    implementation 'org.bouncycastle:bcpkix-jdk15to18:1.84'
 
     // Use custom Conscrypt library. If you want to connect to a remote ADB
-    // daemon instead of the device the app is currently running or do not want
-    // to bypass hidden API, this is the recommended choice.
+    // daemon instead of the device the app is currently running, this is the
+    // recommended choice.
     implementation 'org.conscrypt:conscrypt-android:2.5.3'
 }
 ```
@@ -54,16 +49,6 @@ public class MyAwesomeApp extends Application {
         super.onCreate();
         // Fix random number generation in Android versions below 4.4.
         PRNGFixes.apply();
-    }
-
-    @Override
-    protected void attachBaseContext(Context base) {
-        super.attachBaseContext(base);
-        // Uncomment the following line if you want to bypass hidden API as
-        // described above.
-        // if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-        //     HiddenApiBypass.addHiddenApiExemptions("L");
-        // }
     }
 }
 ```
@@ -105,32 +90,26 @@ public class AdbConnectionManager extends AbsAdbConnectionManager {
             KeyPair generateKeyPair = keyPairGenerator.generateKeyPair();
             PublicKey publicKey = generateKeyPair.getPublic();
             mPrivateKey = generateKeyPair.getPrivate();
-            // Generate a certificate
-            // On Android, it requires sun.security-android library as mentioned
-            // above.
+            // Generate a self-signed certificate with BouncyCastle.
             String subject = "CN=My Awesome App";
             String algorithmName = "SHA512withRSA";
-            long expiryDate = System.currentTimeMillis() + 86400000;
-            CertificateExtensions certificateExtensions = new CertificateExtensions();
-            certificateExtensions.set("SubjectKeyIdentifier", new SubjectKeyIdentifierExtension(
-                    new KeyIdentifier(publicKey).getIdentifier()));
-            X500Name x500Name = new X500Name(subject);
             Date notBefore = new Date();
-            Date notAfter = new Date(expiryDate);
-            certificateExtensions.set("PrivateKeyUsage", new PrivateKeyUsageExtension(notBefore, notAfter));
-            CertificateValidity certificateValidity = new CertificateValidity(notBefore, notAfter);
-            X509CertInfo x509CertInfo = new X509CertInfo();
-            x509CertInfo.set("version", new CertificateVersion(2));
-            x509CertInfo.set("serialNumber", new CertificateSerialNumber(new Random().nextInt() & Integer.MAX_VALUE));
-            x509CertInfo.set("algorithmID", new CertificateAlgorithmId(AlgorithmId.get(algorithmName)));
-            x509CertInfo.set("subject", new CertificateSubjectName(x500Name));
-            x509CertInfo.set("key", new CertificateX509Key(publicKey));
-            x509CertInfo.set("validity", certificateValidity);
-            x509CertInfo.set("issuer", new CertificateIssuerName(x500Name));
-            x509CertInfo.set("extensions", certificateExtensions);
-            X509CertImpl x509CertImpl = new X509CertImpl(x509CertInfo);
-            x509CertImpl.sign(mPrivateKey, algorithmName);
-            mCertificate = x509CertImpl;
+            Date notAfter = new Date(System.currentTimeMillis() + 86400000);
+            BigInteger serialNumber = BigInteger.valueOf(new Random().nextInt() & Integer.MAX_VALUE);
+            X500Name x500Name = new X500Name(subject);
+            JcaX509v3CertificateBuilder builder = new JcaX509v3CertificateBuilder(
+                    x500Name, serialNumber, notBefore, notAfter, x500Name, publicKey);
+            JcaX509ExtensionUtils extUtils = new JcaX509ExtensionUtils();
+            builder.addExtension(Extension.subjectKeyIdentifier, false,
+                    extUtils.createSubjectKeyIdentifier(publicKey));
+            // PrivateKeyUsagePeriod ::= SEQUENCE { notBefore [0] GeneralizedTime, notAfter [1] GeneralizedTime }
+            ASN1EncodableVector period = new ASN1EncodableVector();
+            period.add(new DERTaggedObject(false, 0, new ASN1GeneralizedTime(notBefore)));
+            period.add(new DERTaggedObject(false, 1, new ASN1GeneralizedTime(notAfter)));
+            builder.addExtension(Extension.privateKeyUsagePeriod, false,
+                    PrivateKeyUsagePeriod.getInstance(new DERSequence(period)));
+            ContentSigner signer = new JcaContentSignerBuilder(algorithmName).build(mPrivateKey);
+            mCertificate = new JcaX509CertificateConverter().getCertificate(builder.build(signer));
             // TODO: Store the key pair to some place else.
         }
     }
