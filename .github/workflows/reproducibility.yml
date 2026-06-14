@@ -1,0 +1,73 @@
+name: Reproducibility check
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  reproducibility:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Match the JDK that JitPack uses for this repo (see jitpack.yml: 21.0.4-tem).
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21.0.4'
+          cache: gradle
+
+      - name: Build the release AAR locally
+        run: ./gradlew --no-daemon clean :libadb:assembleRelease
+
+      - name: Hash local AAR
+        id: local
+        run: |
+          set -euo pipefail
+          aar=$(ls libadb/build/outputs/aar/libadb-release.aar)
+          hash=$(sha256sum "$aar" | awk '{print $1}')
+          echo "hash=$hash" >> "$GITHUB_OUTPUT"
+          echo "Local:   $hash  $aar"
+
+      - name: Fetch JitPack build for this commit
+        id: jitpack
+        run: |
+          set -euo pipefail
+          short=$(git rev-parse --short=10 HEAD)
+          base="https://jitpack.io/com/github/osservatorionessuno/libadb-android-bc/${short}"
+          url="${base}/libadb-android-bc-${short}.aar"
+          log="${base}/build.log"
+          echo "URL: $url"
+          # First GET triggers the build; JitPack blocks until done or fails.
+          # Poll up to ~15 min for slow builds.
+          code=000
+          for i in $(seq 1 90); do
+            code=$(curl -sIL -o /dev/null -w '%{http_code}' "$url" --max-time 30 || echo 000)
+            echo "Attempt $i: HTTP $code"
+            [ "$code" = "200" ] && break
+            sleep 10
+          done
+          if [ "$code" != "200" ]; then
+            echo "::error::JitPack did not produce an artifact (last HTTP $code)"
+            echo "--- build.log (tail) ---"
+            curl -sL "$log" | tail -200 || true
+            exit 1
+          fi
+          curl -sL -o "jitpack-${short}.aar" "$url"
+          hash=$(sha256sum "jitpack-${short}.aar" | awk '{print $1}')
+          echo "hash=$hash" >> "$GITHUB_OUTPUT"
+          echo "JitPack: $hash  jitpack-${short}.aar"
+
+      - name: Compare hashes
+        run: |
+          set -euo pipefail
+          local_hash='${{ steps.local.outputs.hash }}'
+          jitpack_hash='${{ steps.jitpack.outputs.hash }}'
+          echo "Local:   $local_hash"
+          echo "JitPack: $jitpack_hash"
+          if [ "$local_hash" != "$jitpack_hash" ]; then
+            echo "::error::SHA-256 mismatch — local build does not match JitPack output"
+            exit 1
+          fi
+          echo "::notice::Reproducible build verified: $local_hash"
