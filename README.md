@@ -3,6 +3,10 @@
 ADB library for Android. It enables an app to connect to the ADB daemon (`adbd` process) belonging to the same or a
 different device and execute arbitrary services or commands (via `shell:` service).
 
+> **Notice:** This is a fork of the original
+> [MuntashirAkon/libadb-android](https://github.com/MuntashirAkon/libadb-android). It is backed entirely by
+> [BouncyCastle](https://www.bouncycastle.org/) with some wrapper to implement both the custom TLS exporter and the custom BoringSSL spake2 implementation.
+
 **Disclaimer:** This library has never gone through a security audit. Please, proceed with caution if security is
 crucial for your app. Avoid using the APIs for reasons other than connecting or using ADB. For the safety of your app
 and its users, open a remote service instead of using ADB and ask the user to disconnect Wireless debugging.
@@ -20,8 +24,9 @@ repositories {
 
 // Add to dependencies section
 dependencies {
-    // Add this library
-    implementation 'com.github.MuntashirAkon:libadb-android:3.1.1'
+    // Add this library (this fork). The version is a JitPack tag/commit — create a
+    // matching git tag (e.g. 3.2.0) on the fork, or use a commit hash.
+    implementation 'com.github.osservatorionessuno:libadb-android-bc:3.2.0'
     
     // Library to generate X509Certificate. You can also use BouncyCastle for
     // this. See example for use-case.

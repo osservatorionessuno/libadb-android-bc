@@ -6,7 +6,7 @@ plugins {
 }
 
 group = 'io.github.muntashirakon'
-version = '3.1.1'
+version = '3.2.0'
 
 android {
     compileSdk 35
@@ -54,7 +54,14 @@ dependencies {
     implementation "androidx.annotation:annotation:1.9.1"
     implementation 'org.bouncycastle:bcprov-jdk15to18:1.84'
     implementation 'org.bouncycastle:bctls-jdk15to18:1.84'
-    implementation 'com.github.MuntashirAkon.spake2-java:spake2-android:2.2.1'
 
     testImplementation 'junit:junit:4.13.2'
+}
+
+// Reproducible archives: strip timestamps and normalise entry order so the AAR
+// (and the sources/javadoc jars) are byte-for-byte identical across machines.
+// This is what the reproducibility GitHub workflow verifies against JitPack.
+tasks.withType(AbstractArchiveTask).configureEach {
+    preserveFileTimestamps = false
+    reproducibleFileOrder = true
 }

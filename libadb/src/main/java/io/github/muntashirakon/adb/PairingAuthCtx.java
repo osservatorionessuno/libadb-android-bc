@@ -25,9 +25,6 @@ import java.util.Arrays;
 
 import javax.security.auth.Destroyable;
 
-import io.github.muntashirakon.crypto.spake2.Spake2Context;
-import io.github.muntashirakon.crypto.spake2.Spake2Role;
-
 @RequiresApi(Build.VERSION_CODES.GINGERBREAD)
 class PairingAuthCtx implements Destroyable {
     // The following values are taken from the following source and are subjected to change
@@ -42,7 +39,7 @@ class PairingAuthCtx implements Destroyable {
     public static final int GCM_IV_LENGTH = 12; // in bytes
 
     private final byte[] mMsg;
-    private final Spake2Context mSpake2Ctx;
+    private final Spake2 mSpake2Ctx;
     private final byte[] mSecretKey = new byte[HKDF_KEY_LENGTH];
     private long mDecIv = 0;
     private long mEncIv = 0;
@@ -50,7 +47,7 @@ class PairingAuthCtx implements Destroyable {
 
     @Nullable
     public static PairingAuthCtx createAlice(byte[] password) {
-        Spake2Context spake25519 = new Spake2Context(Spake2Role.Alice, CLIENT_NAME, SERVER_NAME);
+        Spake2 spake25519 = new Spake2(Spake2.Role.ALICE, CLIENT_NAME, SERVER_NAME);
         try {
             return new PairingAuthCtx(spake25519, password);
         } catch (IllegalArgumentException | IllegalStateException e) {
@@ -61,7 +58,7 @@ class PairingAuthCtx implements Destroyable {
     @VisibleForTesting
     @Nullable
     public static PairingAuthCtx createBob(byte[] password) {
-        Spake2Context spake25519 = new Spake2Context(Spake2Role.Bob, SERVER_NAME, CLIENT_NAME);
+        Spake2 spake25519 = new Spake2(Spake2.Role.BOB, SERVER_NAME, CLIENT_NAME);
         try {
             return new PairingAuthCtx(spake25519, password);
         } catch (IllegalArgumentException | IllegalStateException e) {
@@ -69,7 +66,7 @@ class PairingAuthCtx implements Destroyable {
         }
     }
 
-    private PairingAuthCtx(Spake2Context spake25519, byte[] password)
+    private PairingAuthCtx(Spake2 spake25519, byte[] password)
             throws IllegalArgumentException, IllegalStateException {
         mSpake2Ctx = spake25519;
         mMsg = mSpake2Ctx.generateMessage(password);
