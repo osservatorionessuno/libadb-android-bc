@@ -11,7 +11,6 @@ import java.security.KeyManagementException;
 import java.security.NoSuchAlgorithmException;
 import java.security.Principal;
 import java.security.PrivateKey;
-import java.security.Provider;
 import java.security.SecureRandom;
 import java.security.cert.X509Certificate;
 
@@ -19,9 +18,6 @@ import javax.net.ssl.KeyManager;
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.X509ExtendedKeyManager;
 import javax.net.ssl.X509TrustManager;
-
-import org.bouncycastle.jce.provider.BouncyCastleProvider;
-import org.bouncycastle.jsse.provider.BouncyCastleJsseProvider;
 
 final class SslUtils {
     private static SSLContext sslContext;
@@ -32,11 +28,9 @@ final class SslUtils {
         if (sslContext != null) {
             return sslContext;
         }
-        Provider bcProvider = new BouncyCastleProvider();
-        Provider bcJsseProvider = new BouncyCastleJsseProvider(bcProvider);
-        sslContext = SSLContext.getInstance("TLSv1.3", bcJsseProvider);
-        System.out.println("Using BouncyCastle TLSv1.3 provider...");
-        
+        // Use the platform's default TLS provider (Android's built-in AndroidOpenSSL),
+        // which supports TLS 1.3 on our minSdk and requires no BouncyCastle JCA provider.
+        sslContext = SSLContext.getInstance("TLSv1.3");
         sslContext.init(new KeyManager[]{getKeyManager(keyPair)},
                 new X509TrustManager[]{getAllAcceptingTrustManager()},
                 new SecureRandom());

@@ -28,7 +28,8 @@ import java.security.interfaces.RSAPublicKey;
 import java.util.Arrays;
 import java.util.Objects;
 
-import org.bouncycastle.jce.provider.BouncyCastleProvider;
+import org.bouncycastle.crypto.params.AsymmetricKeyParameter;
+import org.bouncycastle.crypto.util.PrivateKeyFactory;
 import org.bouncycastle.tls.CertificateEntry;
 import org.bouncycastle.tls.CertificateRequest;
 import org.bouncycastle.tls.DefaultTlsClient;
@@ -40,9 +41,8 @@ import org.bouncycastle.tls.TlsCredentials;
 import org.bouncycastle.tls.TlsServerCertificate;
 import org.bouncycastle.tls.crypto.TlsCertificate;
 import org.bouncycastle.tls.crypto.TlsCryptoParameters;
-import org.bouncycastle.tls.crypto.impl.jcajce.JcaDefaultTlsCredentialedSigner;
-import org.bouncycastle.tls.crypto.impl.jcajce.JcaTlsCrypto;
-import org.bouncycastle.tls.crypto.impl.jcajce.JcaTlsCryptoProvider;
+import org.bouncycastle.tls.crypto.impl.bc.BcDefaultTlsCredentialedSigner;
+import org.bouncycastle.tls.crypto.impl.bc.BcTlsCrypto;
 
 // https://github.com/aosp-mirror/platform_system_core/blob/android-11.0.0_r1/adb/pairing_connection/pairing_connection.cpp
 // Also based on Shizuku's implementation
@@ -144,9 +144,8 @@ public final class PairingConnectionCtx implements Closeable {
         // drive the handshake with the low-level TLS API instead. This lets AdbTlsClient export the keying material
         // from within notifyHandshakeComplete(), while the exporter secret is still alive. Any server certificate is
         // accepted; the connection is authenticated via SPAKE2 over that exported keying material.
-        JcaTlsCrypto crypto = new JcaTlsCryptoProvider()
-                .setProvider(new BouncyCastleProvider())
-                .create(new SecureRandom());
+        // Use the lightweight (bc) TLS crypto backend so no JCA provider is required.
+        BcTlsCrypto crypto = new BcTlsCrypto(new SecureRandom());
         TlsClientProtocol protocol = new TlsClientProtocol(socket.getInputStream(), socket.getOutputStream());
         AdbTlsClient client = new AdbTlsClient(crypto, mKeyPair);
         protocol.connect(client);
@@ -290,7 +289,7 @@ public final class PairingConnectionCtx implements Closeable {
         private final KeyPair mKeyPair;
         private byte[] mKeyingMaterial;
 
-        AdbTlsClient(@NonNull JcaTlsCrypto crypto, @NonNull KeyPair keyPair) {
+        AdbTlsClient(@NonNull BcTlsCrypto crypto, @NonNull KeyPair keyPair) {
             super(crypto);
             this.mKeyPair = keyPair;
         }
@@ -316,7 +315,7 @@ public final class PairingConnectionCtx implements Closeable {
 
                 @Override
                 public TlsCredentials getClientCredentials(CertificateRequest certificateRequest) throws IOException {
-                    JcaTlsCrypto crypto = (JcaTlsCrypto) getCrypto();
+                    BcTlsCrypto crypto = (BcTlsCrypto) getCrypto();
                     TlsCertificate tlsCertificate;
                     try {
                         tlsCertificate = crypto.createCertificate(mKeyPair.getCertificate().getEncoded());
@@ -327,8 +326,11 @@ public final class PairingConnectionCtx implements Closeable {
                     org.bouncycastle.tls.Certificate certificate = new org.bouncycastle.tls.Certificate(
                             certificateRequest.getCertificateRequestContext(),
                             new CertificateEntry[]{new CertificateEntry(tlsCertificate, null)});
-                    return new JcaDefaultTlsCredentialedSigner(new TlsCryptoParameters(context), crypto,
-                            mKeyPair.getPrivateKey(), certificate, SignatureAndHashAlgorithm.rsa_pss_rsae_sha256);
+                    // Convert the JCA private key to a lightweight (bc) key parameter for the bc signer.
+                    AsymmetricKeyParameter privateKey = PrivateKeyFactory.createKey(
+                            mKeyPair.getPrivateKey().getEncoded());
+                    return new BcDefaultTlsCredentialedSigner(new TlsCryptoParameters(context), crypto,
+                            privateKey, certificate, SignatureAndHashAlgorithm.rsa_pss_rsae_sha256);
                 }
             };
         }
