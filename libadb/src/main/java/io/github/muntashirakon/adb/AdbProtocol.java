@@ -203,6 +203,25 @@ final class AdbProtocol {
      */
     @NonNull
     public static byte[] generateMessage(@Command int command, int arg0, int arg1, @Nullable byte[] data, int offset, int length) {
+        return generateMessage(command, arg0, arg1, data, offset, length, true);
+    }
+
+    /**
+     * This function generates an ADB message given the fields.
+     *
+     * @param command  Command identifier constant
+     * @param arg0     First argument
+     * @param arg1     Second argument
+     * @param data     The data
+     * @param offset   The start offset in the data
+     * @param length   The number of bytes to take from the data
+     * @param checksum Whether to compute the payload checksum. May only be {@code false} when the negotiated protocol
+     *                 version is at least {@link #A_VERSION_SKIP_CHECKSUM}, in which case the peer ignores the field.
+     * @return Byte array containing the message
+     */
+    @NonNull
+    public static byte[] generateMessage(@Command int command, int arg0, int arg1, @Nullable byte[] data, int offset,
+                                         int length, boolean checksum) {
         // Protocol as defined at https://github.com/aosp-mirror/platform_system_core/blob/6072de17cd812daf238092695f26a552d3122f8c/adb/protocol.txt
         // struct message {
         //     unsigned command;       // command identifier constant
@@ -227,7 +246,7 @@ final class AdbProtocol {
 
         if (data != null) {
             message.putInt(length);
-            message.putInt(getPayloadChecksum(data, offset, length));
+            message.putInt(checksum ? getPayloadChecksum(data, offset, length) : 0);
         } else {
             message.putInt(0);
             message.putInt(0);
@@ -313,6 +332,32 @@ final class AdbProtocol {
     @NonNull
     public static byte[] generateWrite(int localId, int remoteId, byte[] data, int offset, int length) {
         return generateMessage(A_WRTE, localId, remoteId, data, offset, length);
+    }
+
+    /**
+     * Generates only the 24-byte header of a WRITE stream message. The caller is responsible for sending the
+     * referenced payload region right after the header. This avoids copying the payload into a new array.
+     *
+     * @param localId  The unique local ID of the stream
+     * @param remoteId The unique remote ID of the stream
+     * @param data     The data (not copied, only used for the checksum)
+     * @param offset   The start offset in the data
+     * @param length   The number of bytes to take from the data
+     * @param checksum Whether to compute the payload checksum (see
+     *                 {@link #generateMessage(int, int, int, byte[], int, int, boolean)})
+     * @return Byte array containing the message header
+     */
+    @NonNull
+    public static byte[] generateWriteHeader(int localId, int remoteId, @NonNull byte[] data, int offset, int length,
+                                             boolean checksum) {
+        ByteBuffer header = ByteBuffer.allocate(ADB_HEADER_LENGTH).order(ByteOrder.LITTLE_ENDIAN);
+        header.putInt(A_WRTE);
+        header.putInt(localId);
+        header.putInt(remoteId);
+        header.putInt(length);
+        header.putInt(checksum ? getPayloadChecksum(data, offset, length) : 0);
+        header.putInt(~A_WRTE);
+        return header.array();
     }
 
     /**

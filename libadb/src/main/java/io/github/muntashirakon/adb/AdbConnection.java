@@ -121,6 +121,13 @@ public class AdbConnection implements Closeable {
 
     private volatile int mProtocolVersion;
 
+    /**
+     * Whether outgoing packets must carry a payload checksum. Checksums are required until the CONNECT exchange
+     * proves that both sides speak at least {@link AdbProtocol#A_VERSION_SKIP_CHECKSUM}, since an older peer
+     * validates the field and drops the connection on a mismatch.
+     */
+    private volatile boolean mSendChecksum = true;
+
     @NonNull
     private final KeyPair mKeyPair;
 
@@ -264,11 +271,16 @@ public class AdbConnection implements Closeable {
                                     // Notify an open/write
                                     waitingStream.notify();
                                 } else if (msg.command == AdbProtocol.A_WRTE) {
-                                    // Got some data from our partner
-                                    waitingStream.addPayload(msg.payload);
-
-                                    // Tell it we're ready for more
-                                    waitingStream.sendReady();
+                                    if (msg.payload == null) {
+                                        // Empty WRTE: nothing to queue, just tell the peer to continue
+                                        waitingStream.sendReady();
+                                    } else if (waitingStream.addPayload(msg.payload)) {
+                                        // Tell it we're ready for more
+                                        waitingStream.sendReady();
+                                    }
+                                    // Otherwise the read queue is full: the OKAY is deferred until the
+                                    // application drains the queue (see AdbStream#read), which keeps the
+                                    // peer from sending more data (flow control per protocol.txt).
                                 } else { // if (msg.command == AdbProtocol.A_CLSE) {
                                     mOpenedStreams.remove(msg.arg1);
                                     // Notify readers and writers
@@ -328,6 +340,10 @@ public class AdbConnection implements Closeable {
                             synchronized (AdbConnection.this) {
                                 mProtocolVersion = msg.arg0;
                                 mMaxData = msg.arg1;
+                                // Checksums can only be skipped if both what we advertised in our CONNECT
+                                // packet and what the peer advertised in theirs support it.
+                                mSendChecksum = AdbProtocol.getProtocolVersion(mApi) < AdbProtocol.A_VERSION_SKIP_CHECKSUM
+                                        || msg.arg0 < AdbProtocol.A_VERSION_SKIP_CHECKSUM;
                                 mConnectionEstablished = true;
                                 AdbConnection.this.notifyAll();
                             }
@@ -602,6 +618,25 @@ public class AdbConnection implements Closeable {
             os.write(packet);
             os.flush();
         }
+    }
+
+    /**
+     * Sends a packet as a header followed by a region of the payload array, avoiding a copy of the payload.
+     */
+    void sendPacket(byte[] header, byte[] payload, int offset, int length) throws IOException {
+        synchronized (mLock) {
+            OutputStream os = getOutputStream();
+            os.write(header);
+            os.write(payload, offset, length);
+            os.flush();
+        }
+    }
+
+    /**
+     * Whether outgoing packets must carry a payload checksum.
+     */
+    boolean shouldSendChecksum() {
+        return mSendChecksum;
     }
 
     void flushPacket() throws IOException {

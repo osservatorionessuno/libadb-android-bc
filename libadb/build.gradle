@@ -6,7 +6,7 @@ plugins {
 }
 
 group = 'io.github.muntashirakon'
-version = '3.2.0'
+version = '3.3.0'
 
 android {
     compileSdk 35
@@ -29,6 +29,13 @@ android {
     compileOptions {
         sourceCompatibility JavaVersion.VERSION_1_8
         targetCompatibility JavaVersion.VERSION_1_8
+    }
+
+    testOptions {
+        unitTests {
+            // android.util.Log etc. become no-ops instead of throwing in local unit tests
+            returnDefaultValues = true
+        }
     }
 
     publishing {

@@ -2,6 +2,8 @@
 
 package io.github.muntashirakon.adb;
 
+import androidx.annotation.GuardedBy;
+
 import java.io.Closeable;
 import java.io.IOException;
 import java.nio.ByteBuffer;
@@ -36,14 +38,44 @@ public class AdbStream implements Closeable {
     private final AtomicBoolean mWriteReady;
 
     /**
+     * How many bytes may sit unread in {@link #mReadQueue} before OKAY packets are withheld,
+     * as a multiple of the connection's maxData.
+     */
+    private static final int READ_QUEUE_BACKLOG_FACTOR = 8;
+
+    /**
+     * An empty buffer used as the initial read buffer, before the first payload arrives.
+     */
+    private static final ByteBuffer EMPTY_BUFFER = ByteBuffer.wrap(new byte[0]);
+
+    /**
      * A queue of data from the target's WRTE packets
      */
     private final Queue<byte[]> mReadQueue;
 
     /**
-     * Store data received from the first WRTE packet in order to support buffering.
+     * Maximum number of bytes allowed to sit in {@link #mReadQueue}. Once the limit is reached, the OKAY for the
+     * last received WRTE packet is deferred until the application drains the queue, which stops the peer from
+     * sending more data. This bounds the memory used by a stream regardless of how fast the peer produces data.
      */
-    private final ByteBuffer mReadBuffer;
+    private final int mMaxQueuedData;
+
+    /**
+     * Number of payload bytes currently in {@link #mReadQueue}.
+     */
+    @GuardedBy("mReadQueue")
+    private long mQueuedData;
+
+    /**
+     * Whether an OKAY packet is owed to the peer once the read queue drains below {@link #mMaxQueuedData}.
+     */
+    @GuardedBy("mReadQueue")
+    private boolean mReadyPending;
+
+    /**
+     * Holds the payload currently being consumed by the reader. Wraps the arrays received from WRTE packets.
+     */
+    private volatile ByteBuffer mReadBuffer = EMPTY_BUFFER;
 
     /**
      * Indicates whether the connection is closed already
@@ -54,6 +86,13 @@ public class AdbStream implements Closeable {
      * Whether the remote peer has closed but we still have unread data in the queue
      */
     private volatile boolean mPendingClose;
+
+    /**
+     * Whether the stream was closed by the remote peer (graceful end of stream) as opposed to a local close or a
+     * dead connection. Only a peer-initiated close may be reported as a regular end of stream to readers; anything
+     * else has to surface as an error so that a truncated transfer is never mistaken for a complete one.
+     */
+    private volatile boolean mClosedByPeer;
 
     /**
      * Creates a new AdbStream object on the specified AdbConnection
@@ -67,7 +106,8 @@ public class AdbStream implements Closeable {
         this.mAdbConnection = adbConnection;
         this.mLocalId = localId;
         this.mReadQueue = new ConcurrentLinkedQueue<>();
-        this.mReadBuffer = (ByteBuffer) ByteBuffer.allocate(adbConnection.getMaxData()).flip();
+        this.mMaxQueuedData = (int) Math.min((long) adbConnection.getMaxData() * READ_QUEUE_BACKLOG_FACTOR,
+                Integer.MAX_VALUE);
         this.mWriteReady = new AtomicBoolean(false);
         this.mIsClosed = false;
     }
@@ -84,11 +124,19 @@ public class AdbStream implements Closeable {
      * Called by the connection thread to indicate newly received data.
      *
      * @param payload Data inside the WRTE message
+     * @return {@code true} if the peer may be sent an OKAY right away, {@code false} if the read queue is full and
+     * the OKAY has to be deferred until the application drains the queue (see {@link #read(byte[], int, int)}).
      */
-    void addPayload(byte[] payload) {
+    boolean addPayload(byte[] payload) {
         synchronized (mReadQueue) {
             mReadQueue.add(payload);
+            mQueuedData += payload.length;
             mReadQueue.notifyAll();
+            if (mQueuedData < mMaxQueuedData) {
+                return true;
+            }
+            mReadyPending = true;
+            return false;
         }
     }
 
@@ -124,19 +172,22 @@ public class AdbStream implements Closeable {
      */
     void notifyClose(boolean closedByPeer) {
         // We don't call close() because it sends another CLSE
-        if (closedByPeer && !mReadQueue.isEmpty()) {
-            // The remote peer closed the stream, but we haven't finished reading the remaining data
-            mPendingClose = true;
-        } else {
-            mIsClosed = true;
+        synchronized (mReadQueue) {
+            if (closedByPeer) {
+                mClosedByPeer = true;
+            }
+            if (closedByPeer && (!mReadQueue.isEmpty() || mReadBuffer.hasRemaining())) {
+                // The remote peer closed the stream, but we haven't finished reading the remaining data
+                mPendingClose = true;
+            } else {
+                mIsClosed = true;
+            }
+            mReadQueue.notifyAll();
         }
 
         // Notify readers and writers
         synchronized (this) {
             notifyAll();
-        }
-        synchronized (mReadQueue) {
-            mReadQueue.notifyAll();
         }
     }
 
@@ -150,11 +201,13 @@ public class AdbStream implements Closeable {
         if (mReadBuffer.hasRemaining()) {
             return readBuffer(bytes, offset, length);
         }
-        // Buffer has no data, grab from the queue
+        // Buffer has no data, grab the next payload from the queue
+        byte[] data;
+        boolean sendAck = false;
+        boolean eof = false;
         synchronized (mReadQueue) {
-            byte[] data;
-            // Wait for the connection to close or data to be received
-            while ((data = mReadQueue.poll()) == null && !mIsClosed) {
+            // Wait for the stream to close or data to be received
+            while ((data = mReadQueue.poll()) == null && !mIsClosed && !mPendingClose) {
                 try {
                     mReadQueue.wait();
                 } catch (InterruptedException e) {
@@ -162,37 +215,42 @@ public class AdbStream implements Closeable {
                     throw (IOException) new IOException().initCause(e);
                 }
             }
-            // Add data to the buffer
             if (data != null) {
-                mReadBuffer.clear();
-                mReadBuffer.put(data);
-                mReadBuffer.flip();
-                if (mReadBuffer.hasRemaining()) {
-                    return readBuffer(bytes, offset, length);
+                mQueuedData -= data.length;
+                // The buffer has to be swapped while holding the lock so that notifyClose() sees the unread
+                // data and keeps the stream open until it has been consumed.
+                mReadBuffer = ByteBuffer.wrap(data);
+                if (mReadyPending && mQueuedData < mMaxQueuedData) {
+                    // We owe the peer an OKAY for the last WRTE packet: the queue has room again
+                    mReadyPending = false;
+                    sendAck = true;
                 }
-            }
-
-            if (mIsClosed) {
-                throw new IOException("Stream closed.");
-            }
-
-            if (mPendingClose && mReadQueue.isEmpty()) {
+            } else if (mPendingClose) {
                 // The peer closed the stream, and we've finished reading the stream data, so this stream is finished
                 mIsClosed = true;
+                eof = true;
+            } else if (mClosedByPeer) {
+                // The peer closed the stream with nothing left to read: a graceful end of stream
+                eof = true;
             }
         }
+        // The OKAY is sent outside the queue lock so a blocking socket write cannot stall the connection thread
+        if (sendAck) {
+            sendReady();
+        }
 
-        return -1;
+        if (data != null) {
+            return readBuffer(bytes, offset, length);
+        }
+        if (eof) {
+            return -1;
+        }
+        throw new IOException("Stream closed.");
     }
 
     private int readBuffer(byte[] bytes, int offset, int length) {
-        int count = 0;
-        for (int i = offset; i < offset + length; ++i) {
-            if (mReadBuffer.hasRemaining()) {
-                bytes[i] = mReadBuffer.get();
-                ++count;
-            }
-        }
+        int count = Math.min(length, mReadBuffer.remaining());
+        mReadBuffer.get(bytes, offset, count);
         return count;
     }
 
@@ -203,27 +261,6 @@ public class AdbStream implements Closeable {
      * @throws IOException If the stream fails while sending data
      */
     public void write(byte[] bytes, int offset, int length) throws IOException {
-        synchronized (this) {
-            // Make sure we're ready for a WRTE
-            while (!mIsClosed && !mWriteReady.compareAndSet(true, false)) {
-                try {
-                    wait();
-                } catch (InterruptedException e) {
-                    //noinspection UnnecessaryInitCause
-                    throw (IOException) new IOException().initCause(e);
-                }
-            }
-
-            if (mIsClosed) {
-                throw new IOException("Stream closed");
-            }
-        }
-        // Split and send data as WRTE packet
-        // TODO: A WRITE message may not be sent until a READY message is received.
-        //  Once a WRITE message is sent, an additional WRITE message may not be
-        //  sent until another READY message has been received.  Recipients of
-        //  a WRITE message that is in violation of this requirement will CLOSE
-        //  the connection.
         int maxData;
         try {
             maxData = mAdbConnection.getMaxData();
@@ -231,16 +268,31 @@ public class AdbStream implements Closeable {
             //noinspection UnnecessaryInitCause
             throw (IOException) new IOException().initCause(e);
         }
+        boolean checksum = mAdbConnection.shouldSendChecksum();
+        // Split and send data as WRTE packets of at most maxData bytes. A WRTE message may not be sent
+        // until the READY (OKAY) message for the previous one has been received.
         while (length != 0) {
-            if (length <= maxData) {
-                mAdbConnection.sendPacket(AdbProtocol.generateWrite(mLocalId, mRemoteId, bytes, offset, length));
-                offset = offset + length;
-                length = 0;
-            } else { // if (length > maxData) {
-                mAdbConnection.sendPacket(AdbProtocol.generateWrite(mLocalId, mRemoteId, bytes, offset, maxData));
-                offset = offset + maxData;
-                length = length - maxData;
+            synchronized (this) {
+                // Make sure we're ready for a WRTE
+                while (!mIsClosed && !mWriteReady.compareAndSet(true, false)) {
+                    try {
+                        wait();
+                    } catch (InterruptedException e) {
+                        //noinspection UnnecessaryInitCause
+                        throw (IOException) new IOException().initCause(e);
+                    }
+                }
+
+                if (mIsClosed) {
+                    throw new IOException("Stream closed");
+                }
             }
+            int chunk = Math.min(length, maxData);
+            // Send the header and the payload region separately to avoid copying the payload
+            mAdbConnection.sendPacket(AdbProtocol.generateWriteHeader(mLocalId, mRemoteId, bytes, offset, chunk,
+                    checksum), bytes, offset, chunk);
+            offset = offset + chunk;
+            length = length - chunk;
         }
     }
 
