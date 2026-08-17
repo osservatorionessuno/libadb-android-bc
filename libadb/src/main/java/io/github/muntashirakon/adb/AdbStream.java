@@ -95,6 +95,13 @@ public class AdbStream implements Closeable {
     private volatile boolean mClosedByPeer;
 
     /**
+     * Set once the peer's establishing OKAY has been seen. Lets {@link AdbConnection#open} wait on a re-checked
+     * condition instead of a bare notify: without it, an OKAY processed before the opener parks is a lost wakeup
+     * that hangs the open forever.
+     */
+    private volatile boolean mOpened;
+
+    /**
      * Creates a new AdbStream object on the specified AdbConnection
      * with the given local ID.
      *
@@ -165,6 +172,15 @@ public class AdbStream implements Closeable {
      */
     void readyForWrite() {
         mWriteReady.set(true);
+    }
+
+    /** Called by the connection thread when the peer's establishing OKAY arrives. */
+    void markOpened() {
+        mOpened = true;
+    }
+
+    public boolean isOpened() {
+        return mOpened;
     }
 
     /**
