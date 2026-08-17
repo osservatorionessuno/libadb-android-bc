@@ -20,6 +20,7 @@ import java.security.KeyPairGenerator;
 import java.security.PublicKey;
 import java.security.cert.Certificate;
 import java.util.Arrays;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
@@ -125,6 +126,25 @@ public class AdbStreamTest {
             }
             off += read;
             remaining -= read;
+        }
+    }
+
+    @Test(timeout = 30_000)
+    public void openTimesOutWhenPeerNeverAcksTheOpen() throws Exception {
+        mServer = new FakeAdbd(AdbProtocol.A_VERSION_SKIP_CHECKSUM, 64 * 1024);
+        mConnection = AdbConnection.create("127.0.0.1", mServer.getPort(), getKeyPair(), API_ANDROID_11);
+        Future<Boolean> connected = mExecutor.submit(() -> mConnection.connect(10, TimeUnit.SECONDS, false));
+        mServer.acceptAndConnect();
+        assertTrue(connected.get(10, TimeUnit.SECONDS));
+
+        // The server sees the OPEN but deliberately never sends OKAY; a bare wait() would hang forever.
+        Future<AdbStream> opened = mExecutor.submit(() -> mConnection.open("shell:", 500));
+        mServer.expect(AdbProtocol.A_OPEN);
+        try {
+            opened.get(10, TimeUnit.SECONDS);
+            fail("open should have timed out without an establishing OKAY");
+        } catch (ExecutionException e) {
+            assertTrue("expected IOException, got " + e.getCause(), e.getCause() instanceof IOException);
         }
     }
 

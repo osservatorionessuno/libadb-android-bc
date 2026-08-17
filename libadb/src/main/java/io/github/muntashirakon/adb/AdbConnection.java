@@ -49,6 +49,11 @@ public class AdbConnection implements Closeable {
     private final int mApi;
 
     /**
+     * How long {@link #open} waits for the peer's establishing OKAY before giving up.
+     */
+    private static final long OPEN_TIMEOUT_MS = 30_000L;
+
+    /**
      * The last allocated local stream ID. The ID chosen for the next stream will be this value + 1.
      */
     private int mLastLocalId;
@@ -267,9 +272,10 @@ public class AdbConnection implements Closeable {
                                     // We're ready for writes
                                     waitingStream.updateRemoteId(msg.arg0);
                                     waitingStream.readyForWrite();
+                                    waitingStream.markOpened();
 
-                                    // Notify an open/write
-                                    waitingStream.notify();
+                                    // Notify an open/write (notifyAll: an opener and a writer may both wait here)
+                                    waitingStream.notifyAll();
                                 } else if (msg.command == AdbProtocol.A_WRTE) {
                                     if (msg.payload == null) {
                                         // Empty WRTE: nothing to queue, just tell the peer to continue
@@ -512,6 +518,12 @@ public class AdbConnection implements Closeable {
     @NonNull
     public AdbStream open(@NonNull String destination)
             throws IOException, InterruptedException, AdbPairingRequiredException {
+        return open(destination, OPEN_TIMEOUT_MS);
+    }
+
+    @NonNull
+    AdbStream open(@NonNull String destination, long openTimeoutMs)
+            throws IOException, InterruptedException, AdbPairingRequiredException {
         int localId = ++mLastLocalId;
 
         if (!mConnectAttempted) {
@@ -527,15 +539,26 @@ public class AdbConnection implements Closeable {
         // Send OPEN
         sendPacket(AdbProtocol.generateOpen(localId, Objects.requireNonNull(destination)));
 
-        // Wait for the connection thread to receive the OKAY
+        // Wait for the connection thread to receive the OKAY (or a rejecting CLSE). Guarded and
+        // time-bounded: a bare wait() loses the wakeup if the OKAY is processed before we park,
+        // hanging the open forever.
+        long deadline = System.currentTimeMillis() + openTimeoutMs;
         synchronized (stream) {
-            stream.wait();
+            while (!stream.isOpened() && !stream.isClosed()) {
+                long remaining = deadline - System.currentTimeMillis();
+                if (remaining <= 0) break;
+                stream.wait(remaining);
+            }
         }
 
         // Check if the OPEN request was rejected
         if (stream.isClosed()) {
             mOpenedStreams.remove(localId);
             throw new ConnectException("Stream open actively rejected by remote peer.");
+        }
+        if (!stream.isOpened()) {
+            mOpenedStreams.remove(localId);
+            throw new IOException("Stream open timed out after " + openTimeoutMs + "ms: " + destination);
         }
 
         return stream;
