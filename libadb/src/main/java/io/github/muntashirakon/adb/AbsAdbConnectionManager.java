@@ -3,6 +3,7 @@
 package io.github.muntashirakon.adb;
 
 import android.content.Context;
+import android.hardware.usb.UsbDevice;
 import android.os.Build;
 
 import androidx.annotation.CallSuper;
@@ -25,6 +26,7 @@ import java.util.concurrent.atomic.AtomicReference;
 import javax.security.auth.DestroyFailedException;
 
 import io.github.muntashirakon.adb.android.AdbMdns;
+import io.github.muntashirakon.adb.android.AdbUsb;
 
 @SuppressWarnings("unused")
 public abstract class AbsAdbConnectionManager implements Closeable {
@@ -378,6 +380,54 @@ public abstract class AbsAdbConnectionManager implements Closeable {
                     .setDeviceName(Objects.requireNonNull(getDeviceName()))
                     .build();
             return mAdbConnection.connect(mTimeout, mTimeoutUnit, mThrowOnUnauthorised);
+        }
+    }
+
+    /**
+     * Attempt to connect to the ADB daemon of a USB device attached in host (OTG) mode. USB permission for the
+     * device must already be granted ({@link android.hardware.usb.UsbManager#requestPermission}). Authentication
+     * uses the legacy RSA token exchange: on first connect the target shows its "Allow USB debugging?" dialog,
+     * so a generous timeout ({@link #setTimeout(long, TimeUnit)}) leaves the user time to confirm.
+     *
+     * @param context Application context
+     * @param device  An attached USB device exposing an ADB interface (see {@link AdbUsb#isAdbDevice(UsbDevice)})
+     * @return {@code true} if and only if the connection is successful. It returns {@code false} if the connection
+     * attempt is unsuccessful, or it has already been made.
+     * @throws IOException                      If the USB device could not be opened or the connection failed.
+     * @throws InterruptedException             If timeout has reached.
+     * @throws AdbAuthenticationFailedException If {@link #isThrowOnUnauthorised()} is set to {@code true}, and the ADB
+     *                                          daemon has rejected the first authentication attempt, which indicates
+     *                                          that the daemon has not saved the public key from a previous connection.
+     */
+    @WorkerThread
+    @RequiresApi(Build.VERSION_CODES.JELLY_BEAN_MR2)
+    public boolean connectUsb(@NonNull Context context, @NonNull UsbDevice device)
+            throws IOException, InterruptedException, AdbPairingRequiredException {
+        synchronized (mLock) {
+            if (isConnected()) {
+                return false;
+            }
+            AdbChannel channel = AdbUsb.openChannel(context, device);
+            boolean connected = false;
+            try {
+                mAdbConnection = new AdbConnection.Builder()
+                        .setChannel(channel)
+                        .setApi(mApi)
+                        .setKeyPair(getAdbKeyPair())
+                        .setDeviceName(Objects.requireNonNull(getDeviceName()))
+                        .build();
+                connected = mAdbConnection.connect(mTimeout, mTimeoutUnit, mThrowOnUnauthorised);
+                return connected;
+            } finally {
+                if (!connected) {
+                    if (mAdbConnection != null) {
+                        mAdbConnection.close();
+                        mAdbConnection = null;
+                    } else {
+                        channel.close();
+                    }
+                }
+            }
         }
     }
 
