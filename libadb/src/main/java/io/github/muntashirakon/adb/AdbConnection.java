@@ -16,7 +16,6 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.io.UnsupportedEncodingException;
 import java.net.ConnectException;
-import java.net.Socket;
 import java.security.PrivateKey;
 import java.security.cert.Certificate;
 import java.security.interfaces.RSAPublicKey;
@@ -24,8 +23,6 @@ import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 
-import javax.net.ssl.SSLContext;
-import javax.net.ssl.SSLSocket;
 import javax.security.auth.DestroyFailedException;
 
 /**
@@ -36,15 +33,10 @@ public class AdbConnection implements Closeable {
     public static final String TAG = AdbConnection.class.getSimpleName();
 
     /**
-     * The underlying socket that this class uses to communicate with the target device.
+     * The underlying channel that this class uses to communicate with the target device.
      */
     @NonNull
-    private final Socket mSocket;
-
-    @NonNull
-    private final String mHost;
-
-    private final int mPort;
+    private final AdbChannel mChannel;
 
     private final int mApi;
 
@@ -57,34 +49,6 @@ public class AdbConnection implements Closeable {
      * The last allocated local stream ID. The ID chosen for the next stream will be this value + 1.
      */
     private int mLastLocalId;
-
-    /**
-     * The input stream that this class uses to read from the socket.
-     */
-    @GuardedBy("lock")
-    @NonNull
-    private final InputStream mPlainInputStream;
-
-    /**
-     * The output stream that this class uses to read from the socket.
-     */
-    @GuardedBy("lock")
-    @NonNull
-    private final OutputStream mPlainOutputStream;
-
-    /**
-     * The input stream that this class uses to read from the TLS socket.
-     */
-    @GuardedBy("lock")
-    @Nullable
-    private volatile InputStream mTlsInputStream;
-
-    /**
-     * The output stream that this class uses to read from the TLS socket.
-     */
-    @GuardedBy("lock")
-    @Nullable
-    private volatile OutputStream mTlsOutputStream;
 
     /**
      * The backend thread that handles responding to ADB packets.
@@ -150,7 +114,11 @@ public class AdbConnection implements Closeable {
     @NonNull
     private final ConcurrentHashMap<Integer, AdbStream> mOpenedStreams;
 
-    private volatile boolean mIsTls = false;
+    /**
+     * Whether the channel has been upgraded to TLS via the STLS exchange. AUTH is ignored afterwards, since
+     * authentication is part of the TLS handshake.
+     */
+    private volatile boolean mUpgradedToTls = false;
 
     @GuardedBy("lock")
     @NonNull
@@ -194,47 +162,41 @@ public class AdbConnection implements Closeable {
     @WorkerThread
     @NonNull
     static AdbConnection create(@NonNull String host, int port, @NonNull KeyPair keyPair, int api) throws IOException {
-        return new AdbConnection(host, port, keyPair, api);
+        return new AdbConnection(new TcpChannel(host, port, keyPair), keyPair, api);
+    }
+
+    /**
+     * Creates a AdbConnection object over an already-open channel (e.g. ADB over USB).
+     *
+     * @return A new AdbConnection object.
+     */
+    @NonNull
+    static AdbConnection create(@NonNull AdbChannel channel, @NonNull KeyPair keyPair, int api) {
+        return new AdbConnection(channel, keyPair, api);
     }
 
     /**
      * Internal constructor to initialize some internal state
      */
-    @WorkerThread
-    private AdbConnection(@NonNull String host, int port, @NonNull KeyPair keyPair, int api) throws IOException {
-        this.mHost = Objects.requireNonNull(host);
-        this.mPort = port;
+    private AdbConnection(@NonNull AdbChannel channel, @NonNull KeyPair keyPair, int api) {
+        this.mChannel = Objects.requireNonNull(channel);
         this.mApi = api;
         this.mProtocolVersion = AdbProtocol.getProtocolVersion(mApi);
         this.mMaxData = AdbProtocol.getMaxData(api);
         this.mKeyPair = Objects.requireNonNull(keyPair);
-        try {
-            this.mSocket = new Socket(host, port);
-        } catch (Throwable th) {
-            //noinspection UnnecessaryInitCause
-            throw (IOException) new IOException().initCause(th);
-        }
-        this.mPlainInputStream = mSocket.getInputStream();
-        this.mPlainOutputStream = mSocket.getOutputStream();
-
-        // Disable Nagle because we're sending tiny packets
-        mSocket.setTcpNoDelay(true);
-
         this.mOpenedStreams = new ConcurrentHashMap<>();
         this.mLastLocalId = 0;
         this.mConnectionThread = createConnectionThread();
     }
 
-    @GuardedBy("lock")
     @NonNull
     private InputStream getInputStream() {
-        return mIsTls ? Objects.requireNonNull(mTlsInputStream) : mPlainInputStream;
+        return mChannel.getInputStream();
     }
 
-    @GuardedBy("lock")
     @NonNull
     private OutputStream getOutputStream() {
-        return mIsTls ? Objects.requireNonNull(mTlsOutputStream) : mPlainOutputStream;
+        return mChannel.getOutputStream();
     }
 
     /**
@@ -296,25 +258,19 @@ public class AdbConnection implements Closeable {
                             break;
                         }
                         case AdbProtocol.A_STLS: {
+                            if (!mChannel.supportsTls()) {
+                                throw new IOException("Peer requested TLS on a channel that does not support it");
+                            }
                             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.GINGERBREAD) {
                                 sendPacket(AdbProtocol.generateStls());
-
-                                SSLContext sslContext = SslUtils.getSslContext(mKeyPair);
-                                SSLSocket tlsSocket = (SSLSocket) sslContext.getSocketFactory()
-                                        .createSocket(mSocket, mHost, mPort, true);
-                                tlsSocket.startHandshake();
+                                mChannel.upgradeToTls();
+                                mUpgradedToTls = true;
                                 Log.d(TAG, "Handshake succeeded.");
-
-                                synchronized (AdbConnection.this) {
-                                    mTlsInputStream = tlsSocket.getInputStream();
-                                    mTlsOutputStream = tlsSocket.getOutputStream();
-                                    mIsTls = true;
-                                }
                             }
                             break;
                         }
                         case AdbProtocol.A_AUTH: {
-                            if (mIsTls) {
+                            if (mUpgradedToTls) {
                                 break;
                             }
                             if (msg.arg0 != AdbProtocol.ADB_AUTH_TOKEN) {
@@ -431,10 +387,10 @@ public class AdbConnection implements Closeable {
     }
 
     /**
-     * Whether the underlying socket is connected to an ADB daemon and is not in a closed state.
+     * Whether the underlying channel is connected to an ADB daemon and is not in a closed state.
      */
     public boolean isConnected() {
-        return !mSocket.isClosed() && mSocket.isConnected();
+        return mChannel.isConnected();
     }
 
     /**
@@ -612,14 +568,14 @@ public class AdbConnection implements Closeable {
     }
 
     /**
-     * This routine closes the Adb connection and underlying socket
+     * This routine closes the Adb connection and underlying channel
      *
-     * @throws IOException if the socket fails to close
+     * @throws IOException if the channel fails to close
      */
     @Override
     public void close() throws IOException {
-        // Closing the socket will kick the connection thread
-        mSocket.close();
+        // Closing the channel will kick the connection thread
+        mChannel.close();
 
         // Wait for the connection thread to die
         mConnectionThread.interrupt();
@@ -676,6 +632,7 @@ public class AdbConnection implements Closeable {
         private Certificate mCertificate;
         private KeyPair mKeyPair;
         private String mDeviceName;
+        private AdbChannel mChannel;
 
         public Builder() {
         }
@@ -698,6 +655,15 @@ public class AdbConnection implements Closeable {
          */
         public Builder setPort(int port) {
             this.mPort = port;
+            return this;
+        }
+
+        /**
+         * Set an already-open channel to run the connection over (e.g. ADB over USB, see
+         * {@link io.github.muntashirakon.adb.android.AdbUsb}). When set, host and port are ignored.
+         */
+        public Builder setChannel(AdbChannel channel) {
+            this.mChannel = channel;
             return this;
         }
 
@@ -756,7 +722,9 @@ public class AdbConnection implements Closeable {
                 }
                 mKeyPair = new KeyPair(mPrivateKey, mCertificate);
             }
-            AdbConnection adbConnection = create(mHost, mPort, mKeyPair, mApi);
+            AdbConnection adbConnection = mChannel != null
+                    ? create(mChannel, mKeyPair, mApi)
+                    : create(mHost, mPort, mKeyPair, mApi);
             if (mDeviceName != null) {
                 adbConnection.setDeviceName(mDeviceName);
             }
