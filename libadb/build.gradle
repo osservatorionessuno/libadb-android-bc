@@ -63,6 +63,9 @@ dependencies {
     implementation 'org.bouncycastle:bctls-jdk15to18:1.84'
 
     testImplementation 'junit:junit:4.13.2'
+    // Test-only: binds the host's libusb so the USB transport can be driven against a real phone from a
+    // desktop JVM (UsbDeviceIntegrationTest). Not part of the shipped library.
+    testImplementation 'net.java.dev.jna:jna:5.14.0'
 }
 
 // Reproducible archives: strip timestamps and normalise entry order so the AAR
