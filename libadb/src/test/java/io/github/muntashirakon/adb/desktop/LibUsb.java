@@ -43,6 +43,9 @@ public interface LibUsb extends Library {
     int libusb_claim_interface(Pointer handle, int interfaceNumber);
     int libusb_release_interface(Pointer handle, int interfaceNumber);
     int libusb_set_auto_detach_kernel_driver(Pointer handle, int enable);
+    int libusb_clear_halt(Pointer handle, byte endpoint);
+
+    int LIBUSB_ERROR_TIMEOUT = -7;
 
     int libusb_bulk_transfer(Pointer handle, byte endpoint, Pointer data, int length,
                              IntByReference transferred, int timeout);
