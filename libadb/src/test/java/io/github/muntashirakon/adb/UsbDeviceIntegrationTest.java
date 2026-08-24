@@ -83,9 +83,9 @@ public class UsbDeviceIntegrationTest {
             Pointer[] devices = count == 0 ? new Pointer[0] : listHead.getPointerArray(0, (int) count);
 
             Pointer adbDevice = null;
-            LibUsb.InterfaceDescriptor adbInterface = null;
+            AdbIface adbInterface = null;
             for (Pointer device : devices) {
-                LibUsb.InterfaceDescriptor found = findAdbInterface(lib, device);
+                AdbIface found = findAdbInterface(lib, device);
                 if (found != null) {
                     adbDevice = device;
                     adbInterface = found;
@@ -94,24 +94,18 @@ public class UsbDeviceIntegrationTest {
             }
             Assume.assumeTrue("No ADB USB device attached (enable USB debugging + `adb kill-server`); skipping",
                     adbDevice != null);
+            assertTrue("ADB interface must expose bulk endpoints",
+                    adbInterface.inEndpoint != 0 && adbInterface.outEndpoint != 0);
 
-            byte inEndpoint = 0, outEndpoint = 0;
-            for (LibUsb.EndpointDescriptor ep : adbInterface.endpoints()) {
-                if ((ep.bmAttributes & LibUsb.LIBUSB_TRANSFER_TYPE_MASK) != LibUsb.LIBUSB_TRANSFER_TYPE_BULK) continue;
-                if ((ep.bEndpointAddress & LibUsb.LIBUSB_ENDPOINT_DIR_MASK) == LibUsb.LIBUSB_ENDPOINT_IN) {
-                    inEndpoint = ep.bEndpointAddress;
-                } else {
-                    outEndpoint = ep.bEndpointAddress;
-                }
-            }
-            assertTrue("ADB interface must expose bulk endpoints", inEndpoint != 0 && outEndpoint != 0);
+            byte inEndpoint = adbInterface.inEndpoint;
+            byte outEndpoint = adbInterface.outEndpoint;
 
             PointerByReference handleRef = new PointerByReference();
             int open = lib.libusb_open(adbDevice, handleRef);
             Assume.assumeTrue("could not open the device (permission?); skipping", open == LibUsb.LIBUSB_SUCCESS);
             Pointer handle = handleRef.getValue();
             lib.libusb_set_auto_detach_kernel_driver(handle, 1);
-            int ifaceNum = adbInterface.bInterfaceNumber & 0xFF;
+            int ifaceNum = adbInterface.number;
             int claim = lib.libusb_claim_interface(handle, ifaceNum);
             if (claim != LibUsb.LIBUSB_SUCCESS) {
                 lib.libusb_close(handle);
@@ -143,7 +137,14 @@ public class UsbDeviceIntegrationTest {
         }
     }
 
-    private static LibUsb.InterfaceDescriptor findAdbInterface(LibUsb lib, Pointer device) {
+    /** Plain-data holder: the pointer-backed descriptors must not outlive the config descriptor we free below. */
+    private static final class AdbIface {
+        int number;
+        byte inEndpoint;
+        byte outEndpoint;
+    }
+
+    private static AdbIface findAdbInterface(LibUsb lib, Pointer device) {
         PointerByReference configRef = new PointerByReference();
         if (lib.libusb_get_active_config_descriptor(device, configRef) != LibUsb.LIBUSB_SUCCESS) return null;
         Pointer configPtr = configRef.getValue();
@@ -154,7 +155,20 @@ public class UsbDeviceIntegrationTest {
                     if ((d.bInterfaceClass & 0xFF) == ADB_CLASS
                             && (d.bInterfaceSubClass & 0xFF) == ADB_SUBCLASS
                             && (d.bInterfaceProtocol & 0xFF) == ADB_PROTOCOL) {
-                        return d;
+                        // Extract everything now, while the config descriptor is still alive.
+                        AdbIface result = new AdbIface();
+                        result.number = d.bInterfaceNumber & 0xFF;
+                        for (LibUsb.EndpointDescriptor ep : d.endpoints()) {
+                            if ((ep.bmAttributes & LibUsb.LIBUSB_TRANSFER_TYPE_MASK) != LibUsb.LIBUSB_TRANSFER_TYPE_BULK) {
+                                continue;
+                            }
+                            if ((ep.bEndpointAddress & LibUsb.LIBUSB_ENDPOINT_DIR_MASK) == LibUsb.LIBUSB_ENDPOINT_IN) {
+                                result.inEndpoint = ep.bEndpointAddress;
+                            } else {
+                                result.outEndpoint = ep.bEndpointAddress;
+                            }
+                        }
+                        return result;
                     }
                 }
             }
