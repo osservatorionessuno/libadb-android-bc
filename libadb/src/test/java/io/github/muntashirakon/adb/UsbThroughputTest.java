@@ -9,7 +9,12 @@ import org.junit.Assume;
 import org.junit.BeforeClass;
 import org.junit.Test;
 
+import java.io.EOFException;
 import java.io.InputStream;
+import java.io.OutputStream;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import java.nio.charset.StandardCharsets;
 
 import io.github.muntashirakon.adb.desktop.DesktopUsb;
 
@@ -78,6 +83,19 @@ public class UsbThroughputTest {
                     (bytes / (double) MiB) / seconds);
             assertEquals("1 GiB transfer must complete exactly", big * MiB, bytes);
 
+            System.out.println("\n=== File pull via sync: protocol (the real acquisition path) ===");
+            String path = "/data/local/tmp/libadb_bench.bin";
+            drain(connection, "shell:dd if=/dev/zero of=" + path + " bs=1m count=400 2>/dev/null");
+            for (int i = 1; i <= 2; i++) {
+                long ps = System.nanoTime();
+                long pulled = syncRecv(connection, path);
+                double psec = (System.nanoTime() - ps) / 1e9;
+                System.out.printf("  sync pull #%d: %.0f MiB in %6.2f s = %6.1f MiB/s%n",
+                        i, pulled / (double) MiB, psec, (pulled / (double) MiB) / psec);
+                assertEquals("sync pull must be complete", 400 * MiB, pulled);
+            }
+            drain(connection, "shell:rm -f " + path);
+
             System.out.println("\n=== Small-command round-trip latency ===");
             int iterations = 20;
             long rtStart = System.nanoTime();
@@ -97,6 +115,55 @@ public class UsbThroughputTest {
     private static long readZeros(AdbConnection connection, boolean useExec, long sizeMiB) throws Exception {
         String prefix = useExec ? "exec:" : "shell:";
         return drain(connection, prefix + "dd if=/dev/zero bs=1048576 count=" + sizeMiB + " 2>/dev/null");
+    }
+
+    /** Pull a file via the ADB sync protocol (RECV) — the same path {@code adb pull} and file acquisition use. */
+    private static long syncRecv(AdbConnection connection, String path) throws Exception {
+        try (AdbStream stream = connection.open("sync:")) {
+            OutputStream out = stream.openOutputStream();
+            InputStream in = stream.openInputStream();
+            byte[] p = path.getBytes(StandardCharsets.UTF_8);
+            ByteBuffer req = ByteBuffer.allocate(8 + p.length).order(ByteOrder.LITTLE_ENDIAN);
+            req.put("RECV".getBytes(StandardCharsets.US_ASCII)).putInt(p.length).put(p);
+            out.write(req.array());
+            out.flush();
+
+            long total = 0;
+            byte[] header = new byte[8];
+            byte[] buffer = new byte[64 * 1024];
+            while (true) {
+                readFully(in, header, 8);
+                String id = new String(header, 0, 4, StandardCharsets.US_ASCII);
+                int value = ByteBuffer.wrap(header, 4, 4).order(ByteOrder.LITTLE_ENDIAN).getInt();
+                if ("DATA".equals(id)) {
+                    int remaining = value;
+                    while (remaining > 0) {
+                        int n = in.read(buffer, 0, Math.min(remaining, buffer.length));
+                        if (n < 0) throw new EOFException("sync stream ended mid-DATA");
+                        remaining -= n;
+                        total += n;
+                    }
+                } else if ("DONE".equals(id)) {
+                    break;
+                } else if ("FAIL".equals(id)) {
+                    byte[] msg = new byte[value];
+                    readFully(in, msg, value);
+                    throw new java.io.IOException("sync FAIL: " + new String(msg, StandardCharsets.UTF_8));
+                } else {
+                    throw new java.io.IOException("unexpected sync id: " + id);
+                }
+            }
+            return total;
+        }
+    }
+
+    private static void readFully(InputStream in, byte[] buffer, int length) throws Exception {
+        int off = 0;
+        while (off < length) {
+            int n = in.read(buffer, off, length - off);
+            if (n < 0) throw new EOFException("stream ended after " + off + " of " + length + " bytes");
+            off += n;
+        }
     }
 
     private static long drain(AdbConnection connection, String destination) throws Exception {
