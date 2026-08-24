@@ -35,6 +35,10 @@ android {
         unitTests {
             // android.util.Log etc. become no-ops instead of throwing in local unit tests
             returnDefaultValues = true
+            // Forward the opt-in benchmark flag into the forked test JVM: -PusbBenchmark=true
+            all {
+                systemProperty 'libadb.usb.benchmark', project.findProperty('usbBenchmark') ?: 'false'
+            }
         }
     }
 
