@@ -103,7 +103,25 @@ public final class AdbUsb {
             connection.close();
             throw new IOException("Could not claim the ADB interface");
         }
+        // Discard anything already queued on the IN endpoint before the handshake. A cleanly reset
+        // interface has nothing pending (this returns immediately), but if a previous session was torn
+        // down mid-transfer the daemon may still have bytes buffered; reading them now keeps the first
+        // header read from starting mid-stream. Best-effort and time-bounded.
+        drainStaleInput(connection, in);
         return new UsbChannel(new DeviceConnectionBulkIo(connection, usbInterface, in, out));
+    }
+
+    @RequiresApi(Build.VERSION_CODES.JELLY_BEAN_MR2)
+    private static void drainStaleInput(@NonNull UsbDeviceConnection connection, @NonNull UsbEndpoint in) {
+        // Packet-aligned buffer and a short timeout, so a full IN packet can never overflow the request.
+        byte[] scratch = new byte[16 * 1024];
+        long deadline = System.currentTimeMillis() + 250;
+        while (System.currentTimeMillis() < deadline) {
+            int n = connection.bulkTransfer(in, scratch, scratch.length, 50);
+            if (n <= 0) {
+                return;   // timed out (pipe empty) or errored: nothing more to drain
+            }
+        }
     }
 
     @RequiresApi(Build.VERSION_CODES.JELLY_BEAN_MR2)
