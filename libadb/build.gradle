@@ -6,7 +6,7 @@ plugins {
 }
 
 group = 'io.github.muntashirakon'
-version = '3.3.0'
+version = '3.4.0'
 
 android {
     compileSdk 35
