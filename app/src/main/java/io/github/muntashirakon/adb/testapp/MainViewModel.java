@@ -3,6 +3,7 @@
 package io.github.muntashirakon.adb.testapp;
 
 import android.app.Application;
+import android.hardware.usb.UsbDevice;
 import android.os.Build;
 
 import androidx.annotation.NonNull;
@@ -106,6 +107,62 @@ public class MainViewModel extends AndroidViewModel {
 
     public void autoConnect() {
         executor.submit(this::autoConnectInternal);
+    }
+
+    /**
+     * Connect to a device attached over USB (OTG). USB permission must already be granted. The whole attempt is
+     * reported in the output pane so it can be followed with the phone unplugged from any computer.
+     */
+    public void connectUsb(@NonNull UsbDevice device) {
+        executor.submit(() -> {
+            StringBuilder log = new StringBuilder();
+            log.append("USB ").append(device.getDeviceName())
+                    .append(" vid=").append(String.format("%04x", device.getVendorId()))
+                    .append(" pid=").append(String.format("%04x", device.getProductId()))
+                    .append(' ').append(device.getManufacturerName()).append(' ').append(device.getProductName())
+                    .append("\nConnecting… approve \"Allow USB debugging?\" on the target if asked.\n");
+            commandOutput.postValue(log);
+            try {
+                AbsAdbConnectionManager manager = AdbConnectionManager.getInstance(getApplication());
+                // Legacy RSA auth: the first connect waits for the target's "Allow USB debugging?" dialog.
+                manager.setTimeout(60, TimeUnit.SECONDS);
+                long start = System.currentTimeMillis();
+                boolean connected = manager.connectUsb(getApplication(), device);
+                log.append("connectUsb -> ").append(connected)
+                        .append(" (").append(System.currentTimeMillis() - start).append(" ms)\n");
+                if (connected) {
+                    log.append(runShell(manager, "getprop ro.product.model ro.build.version.release"));
+                    log.append(runShell(manager, "getprop ro.serialno"));
+                    log.append("Type a command below; the shell runs over USB.\n");
+                }
+                commandOutput.postValue(log);
+                connectAdb.postValue(connected);
+            } catch (Throwable th) {
+                th.printStackTrace();
+                log.append("FAILED: ").append(th).append('\n');
+                for (Throwable c = th.getCause(); c != null; c = c.getCause()) {
+                    log.append("  caused by: ").append(c).append('\n');
+                }
+                commandOutput.postValue(log);
+                connectAdb.postValue(false);
+            }
+        });
+    }
+
+    @WorkerThread
+    @NonNull
+    private static String runShell(@NonNull AbsAdbConnectionManager manager, @NonNull String command)
+            throws IOException, InterruptedException {
+        StringBuilder sb = new StringBuilder("$ ").append(command).append('\n');
+        try (AdbStream stream = manager.openStream("shell:" + command);
+             BufferedReader reader = new BufferedReader(new InputStreamReader(stream.openInputStream(),
+                     StandardCharsets.UTF_8))) {
+            String line;
+            while ((line = reader.readLine()) != null) {
+                sb.append(line).append('\n');
+            }
+        }
+        return sb.toString();
     }
 
     public void disconnect() {

@@ -12,6 +12,11 @@
         android:icon="@drawable/ic_link_off"
         app:showAsAction="always" />
     <item
+        android:id="@+id/action_usb"
+        android:title="@string/connect_usb"
+        android:icon="@drawable/ic_usb"
+        app:showAsAction="always" />
+    <item
         android:id="@+id/action_pair"
         android:title="@string/pair_adb"
         android:icon="@drawable/ic_add_link"

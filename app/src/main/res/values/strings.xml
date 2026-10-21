@@ -12,4 +12,9 @@
     <string name="disconnect_adb">Disconnect</string>
     <string name="pairing_code">Pairing Code</string>
     <string name="port_number">Port Number</string>
+    <string name="connect_usb">USB</string>
+    <string name="usb_no_host">This device has no USB host support.</string>
+    <string name="usb_no_adb_device">No USB device with an ADB interface is attached. Is the target plugged in with USB debugging on?</string>
+    <string name="usb_pick_device">Choose the USB device</string>
+    <string name="usb_permission_denied">USB permission denied.</string>
 </resources>
