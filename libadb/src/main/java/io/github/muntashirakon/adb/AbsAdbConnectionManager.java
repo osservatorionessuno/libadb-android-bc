@@ -400,7 +400,7 @@ public abstract class AbsAdbConnectionManager implements Closeable {
      *                                          that the daemon has not saved the public key from a previous connection.
      */
     @WorkerThread
-    @RequiresApi(Build.VERSION_CODES.JELLY_BEAN_MR2)
+    @RequiresApi(Build.VERSION_CODES.O)
     public boolean connectUsb(@NonNull Context context, @NonNull UsbDevice device)
             throws IOException, InterruptedException, AdbPairingRequiredException {
         synchronized (mLock) {
