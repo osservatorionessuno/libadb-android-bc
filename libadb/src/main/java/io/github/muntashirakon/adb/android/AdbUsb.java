@@ -20,6 +20,7 @@ import androidx.annotation.Nullable;
 import androidx.annotation.RequiresApi;
 
 import java.io.IOException;
+import java.io.InterruptedIOException;
 import java.nio.ByteBuffer;
 import java.util.concurrent.TimeoutException;
 
@@ -161,6 +162,8 @@ public final class AdbUsb {
         private final Object mReaped = new Object();
         private boolean mInDone;
         private boolean mOutDone;
+        private boolean mReaping;
+        private boolean mFailed;
         private volatile boolean mClosed = false;
         @Nullable
         private BroadcastReceiver mDetachReceiver;
@@ -230,8 +233,10 @@ public final class AdbUsb {
         }
 
         /**
-         * Block until [request] has completed. Reaps whatever completes meanwhile: the other
-         * request's completion is recorded for its owner. [deadline] 0 waits forever.
+         * Block until [request] has completed. One thread at a time reaps completions for both
+         * requests (requestWait hands back whichever finished); the other waits on the monitor and
+         * is woken the moment its request is reaped, instead of noticing at the end of its own
+         * wait slice. [deadline] 0 waits forever.
          */
         private void await(@NonNull UsbRequest request, long deadline) throws IOException {
             boolean in = request == mInRequest;
@@ -241,23 +246,37 @@ public final class AdbUsb {
                         if (in) mInDone = false; else mOutDone = false;
                         return;
                     }
+                    if (mClosed) throw new IOException("USB channel closed");
+                    if (mFailed) throw new IOException("USB transfer failed");
+                    if (deadline != 0 && System.currentTimeMillis() >= deadline) {
+                        request.cancel();
+                        throw new IOException("USB bulk write timed out after " + WRITE_TIMEOUT_MS + " ms");
+                    }
+                    if (mReaping) {
+                        long wait = deadline == 0 ? WAIT_SLICE_MS : Math.max(1, Math.min(WAIT_SLICE_MS, deadline - System.currentTimeMillis()));
+                        try {
+                            mReaped.wait(wait);
+                        } catch (InterruptedException e) {
+                            throw new InterruptedIOException("interrupted waiting for a USB transfer");
+                        }
+                        continue;
+                    }
+                    mReaping = true;
                 }
-                if (mClosed) throw new IOException("USB channel closed");
-                if (deadline != 0 && System.currentTimeMillis() >= deadline) {
-                    request.cancel();
-                    throw new IOException("USB bulk write timed out after " + WRITE_TIMEOUT_MS + " ms");
-                }
-                UsbRequest done;
+                UsbRequest done = null;
+                boolean timedOut = false;
                 try {
                     done = mConnection.requestWait(WAIT_SLICE_MS);
                 } catch (TimeoutException e) {
-                    continue;
-                }
-                if (done == null) throw new IOException(mClosed ? "USB channel closed" : "USB transfer failed");
-                if (done == request) return;
-                synchronized (mReaped) {
-                    if (done == mInRequest) mInDone = true;
-                    else if (done == mOutRequest) mOutDone = true;
+                    timedOut = true;
+                } finally {
+                    synchronized (mReaped) {
+                        mReaping = false;
+                        if (done == mInRequest) mInDone = true;
+                        else if (done == mOutRequest) mOutDone = true;
+                        else if (done == null && !timedOut && !mClosed) mFailed = true;
+                        mReaped.notifyAll();
+                    }
                 }
             }
         }
@@ -277,6 +296,9 @@ public final class AdbUsb {
             if (mClosed) return;
             // Cancelling the requests and closing the connection unblock a waiting read or write.
             mClosed = true;
+            synchronized (mReaped) {
+                mReaped.notifyAll();
+            }
             BroadcastReceiver receiver = mDetachReceiver;
             mDetachReceiver = null;
             if (receiver != null) {
