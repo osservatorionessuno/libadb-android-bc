@@ -118,26 +118,28 @@ public class UsbChannel implements AdbChannel {
         }
 
         private void fill() throws IOException {
-            byte[] chunk;
-            if (mPayloadRemaining == 0) {
-                chunk = new byte[AdbProtocol.ADB_HEADER_LENGTH];
-                readExact(chunk);
-                checkHeader(chunk);
-                mPayloadRemaining = readLeInt(chunk, 12);
-            } else {
-                chunk = new byte[Math.min(mPayloadRemaining, mIo.getMaxBulkSize())];
-                readExact(chunk);
-                mPayloadRemaining -= chunk.length;
+            if (mChunk == null) {
+                mChunk = new byte[Math.max(AdbProtocol.ADB_HEADER_LENGTH, mIo.getMaxBulkSize())];
             }
-            mChunk = chunk;
+            int length;
+            if (mPayloadRemaining == 0) {
+                length = AdbProtocol.ADB_HEADER_LENGTH;
+                readExact(mChunk, length);
+                checkHeader(mChunk);
+                mPayloadRemaining = readLeInt(mChunk, 12);
+            } else {
+                length = Math.min(mPayloadRemaining, mIo.getMaxBulkSize());
+                readExact(mChunk, length);
+                mPayloadRemaining -= length;
+            }
             mPos = 0;
-            mEnd = chunk.length;
+            mEnd = length;
         }
 
-        private void readExact(@NonNull byte[] buffer) throws IOException {
+        private void readExact(@NonNull byte[] buffer, int length) throws IOException {
             int offset = 0;
-            while (offset < buffer.length) {
-                int n = mIo.bulkRead(buffer, offset, buffer.length - offset);
+            while (offset < length) {
+                int n = mIo.bulkRead(buffer, offset, length - offset);
                 if (n < 0) {
                     throw new IOException("USB bulk read failed");
                 }
