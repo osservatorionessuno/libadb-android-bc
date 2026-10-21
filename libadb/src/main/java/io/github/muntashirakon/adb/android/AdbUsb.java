@@ -2,7 +2,10 @@
 
 package io.github.muntashirakon.adb.android;
 
+import android.content.BroadcastReceiver;
 import android.content.Context;
+import android.content.Intent;
+import android.content.IntentFilter;
 import android.hardware.usb.UsbConstants;
 import android.hardware.usb.UsbDevice;
 import android.hardware.usb.UsbDeviceConnection;
@@ -111,7 +114,7 @@ public final class AdbUsb {
         // down mid-transfer the daemon may still have bytes buffered; reading them now keeps the first
         // header read from starting mid-stream. Best-effort and time-bounded.
         drainStaleInput(connection, in);
-        return new UsbChannel(new DeviceConnectionBulkIo(connection, usbInterface, in, out));
+        return new UsbChannel(new DeviceConnectionBulkIo(context, device, connection, usbInterface, in, out));
     }
 
     @RequiresApi(Build.VERSION_CODES.JELLY_BEAN_MR2)
@@ -129,43 +132,67 @@ public final class AdbUsb {
 
     @RequiresApi(Build.VERSION_CODES.O)
     private static final class DeviceConnectionBulkIo implements UsbBulkIo {
-        // bulkTransfer is capped at 16 KiB before API 28; being packet-aligned it is a safe chunk everywhere.
-        private static final int MAX_BULK_SIZE = 16 * 1024;
-        // One wait on the queued IN request; it stays queued across timeouts, this only re-checks close().
-        private static final long READ_WAIT_MS = 1_000L;
+        // One URB per ADB payload from API 28, where usbfs no longer caps a request at 16 KiB.
+        private static final int MAX_BULK_SIZE = Build.VERSION.SDK_INT >= Build.VERSION_CODES.P ? 1 << 20 : 16 * 1024;
+        // One wait on a queued request; it stays queued across timeouts, this only re-checks close().
+        private static final long WAIT_SLICE_MS = 1_000L;
         // The daemon drains a write at once; one it does not accept within this is a dead link.
-        private static final int WRITE_TIMEOUT_MS = 10_000;
+        private static final long WRITE_TIMEOUT_MS = 10_000L;
 
+        @NonNull
+        private final Context mContext;
         @NonNull
         private final UsbDeviceConnection mConnection;
         @NonNull
         private final UsbInterface mInterface;
-        @NonNull
-        private final UsbEndpoint mOut;
+        // Queued requests on direct buffers: nothing on the Java heap is pinned while a transfer
+        // waits, so a quiet daemon never blocks garbage collection (bulkTransfer pins its array
+        // in a JNI critical section for the whole transfer on Android 13/14).
         @NonNull
         private final UsbRequest mInRequest = new UsbRequest();
-        // Direct: a queued request on a direct buffer pins nothing on the Java heap.
+        @NonNull
+        private final UsbRequest mOutRequest = new UsbRequest();
         @NonNull
         private final ByteBuffer mInBuffer = ByteBuffer.allocateDirect(MAX_BULK_SIZE);
+        @NonNull
+        private final ByteBuffer mOutBuffer = ByteBuffer.allocateDirect(MAX_BULK_SIZE);
+        // requestWait() hands back whichever request finished, so the reader may reap the
+        // writer's completion and vice versa; they pass them to each other here.
+        private final Object mReaped = new Object();
+        private boolean mInDone;
+        private boolean mOutDone;
         private volatile boolean mClosed = false;
+        @Nullable
+        private BroadcastReceiver mDetachReceiver;
 
-        private DeviceConnectionBulkIo(@NonNull UsbDeviceConnection connection, @NonNull UsbInterface usbInterface,
+        private DeviceConnectionBulkIo(@NonNull Context context, @NonNull UsbDevice device,
+                                       @NonNull UsbDeviceConnection connection, @NonNull UsbInterface usbInterface,
                                        @NonNull UsbEndpoint in, @NonNull UsbEndpoint out) throws IOException {
+            mContext = context.getApplicationContext();
             mConnection = connection;
             mInterface = usbInterface;
-            mOut = out;
-            if (!mInRequest.initialize(connection, in)) {
-                throw new IOException("Could not initialize the USB IN request");
+            if (!mInRequest.initialize(connection, in) || !mOutRequest.initialize(connection, out)) {
+                throw new IOException("Could not initialize the USB requests");
+            }
+            // A pulled cable fails the next transfer anyway; this fails it now.
+            final String name = device.getDeviceName();
+            mDetachReceiver = new BroadcastReceiver() {
+                @Override
+                public void onReceive(Context c, Intent intent) {
+                    UsbDevice gone = intent.getParcelableExtra(UsbManager.EXTRA_DEVICE);
+                    if (gone != null && name.equals(gone.getDeviceName())) {
+                        close();
+                    }
+                }
+            };
+            IntentFilter filter = new IntentFilter(UsbManager.ACTION_USB_DEVICE_DETACHED);
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                mContext.registerReceiver(mDetachReceiver, filter, Context.RECEIVER_NOT_EXPORTED);
+            } else {
+                mContext.registerReceiver(mDetachReceiver, filter);
             }
         }
 
-        /**
-         * Reads through a queued {@link UsbRequest} rather than {@link UsbDeviceConnection#bulkTransfer}:
-         * bulkTransfer pins the Java array in a JNI critical section for the whole transfer (Android 13
-         * and 14), which forbids garbage collection for as long as the daemon stays quiet, and so stalls
-         * every thread of the process on the next allocation. A queued request waits in native code with
-         * nothing pinned, and a timed-out wait leaves it queued, so no bytes are lost.
-         */
         @Override
         public int bulkRead(@NonNull byte[] buffer, int offset, int length) throws IOException {
             int len = Math.min(length, MAX_BULK_SIZE);
@@ -175,18 +202,7 @@ public final class AdbUsb {
                 if (!mInRequest.queue(mInBuffer)) {
                     throw new IOException(mClosed ? "USB channel closed" : "USB bulk read failed to queue");
                 }
-                UsbRequest done;
-                while (true) {
-                    try {
-                        done = mConnection.requestWait(READ_WAIT_MS);
-                        break;
-                    } catch (TimeoutException e) {
-                        if (mClosed) throw new IOException("USB channel closed");
-                    }
-                }
-                if (mClosed) throw new IOException("USB channel closed");
-                if (done == null) throw new IOException("USB bulk read failed");
-                // Writes use bulkTransfer, so the IN request is the only one ever queued here.
+                await(mInRequest, 0);
                 int n = mInBuffer.position();
                 if (n > 0) {
                     mInBuffer.flip();
@@ -199,9 +215,50 @@ public final class AdbUsb {
 
         @Override
         public void bulkWrite(@NonNull byte[] buffer, int offset, int length) throws IOException {
-            int n = mConnection.bulkTransfer(mOut, buffer, offset, length, WRITE_TIMEOUT_MS);
+            // Callers hand over at most getMaxBulkSize() bytes (UsbChannel.writeChunked).
+            mOutBuffer.clear();
+            mOutBuffer.put(buffer, offset, length);
+            mOutBuffer.flip();
+            if (!mOutRequest.queue(mOutBuffer)) {
+                throw new IOException(mClosed ? "USB channel closed" : "USB bulk write failed to queue");
+            }
+            await(mOutRequest, System.currentTimeMillis() + WRITE_TIMEOUT_MS);
+            int n = mOutBuffer.position();
             if (n != length) {
                 throw new IOException(mClosed ? "USB channel closed" : "USB bulk write failed (" + n + "/" + length + ")");
+            }
+        }
+
+        /**
+         * Block until [request] has completed. Reaps whatever completes meanwhile: the other
+         * request's completion is recorded for its owner. [deadline] 0 waits forever.
+         */
+        private void await(@NonNull UsbRequest request, long deadline) throws IOException {
+            boolean in = request == mInRequest;
+            while (true) {
+                synchronized (mReaped) {
+                    if (in ? mInDone : mOutDone) {
+                        if (in) mInDone = false; else mOutDone = false;
+                        return;
+                    }
+                }
+                if (mClosed) throw new IOException("USB channel closed");
+                if (deadline != 0 && System.currentTimeMillis() >= deadline) {
+                    request.cancel();
+                    throw new IOException("USB bulk write timed out after " + WRITE_TIMEOUT_MS + " ms");
+                }
+                UsbRequest done;
+                try {
+                    done = mConnection.requestWait(WAIT_SLICE_MS);
+                } catch (TimeoutException e) {
+                    continue;
+                }
+                if (done == null) throw new IOException(mClosed ? "USB channel closed" : "USB transfer failed");
+                if (done == request) return;
+                synchronized (mReaped) {
+                    if (done == mInRequest) mInDone = true;
+                    else if (done == mOutRequest) mOutDone = true;
+                }
             }
         }
 
@@ -217,14 +274,25 @@ public final class AdbUsb {
 
         @Override
         public void close() {
-            // Cancelling the request and closing the connection unblock a waiting read.
+            if (mClosed) return;
+            // Cancelling the requests and closing the connection unblock a waiting read or write.
             mClosed = true;
+            BroadcastReceiver receiver = mDetachReceiver;
+            mDetachReceiver = null;
+            if (receiver != null) {
+                try {
+                    mContext.unregisterReceiver(receiver);
+                } catch (IllegalArgumentException ignored) {
+                }
+            }
             mInRequest.cancel();
+            mOutRequest.cancel();
             try {
                 mConnection.releaseInterface(mInterface);
             } finally {
                 mConnection.close();
                 mInRequest.close();
+                mOutRequest.close();
             }
         }
     }
